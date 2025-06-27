@@ -2,7 +2,7 @@
 
 |||
 |---|---|
-|![image](https://github.com/user-attachments/assets/7d5ad6ba-30ec-4c6c-8e80-37775bfad7e6)|![image](https://github.com/user-attachments/assets/fca84c9b-211e-41fc-86a9-583e187cd6f1)|
+|![image](https://github.com/user-attachments/assets/f614b579-c232-4f33-b994-f196c225edcf)|![image](https://github.com/user-attachments/assets/fca84c9b-211e-41fc-86a9-583e187cd6f1)|
 
 An advanced LoRA loader for ComfyUI that provides granular, block-level control over how a LoRA is applied to both **SDXL** and **FLUX** models.
 
