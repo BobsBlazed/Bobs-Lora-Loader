@@ -20,7 +20,7 @@ This node allows you to go beyond a single strength slider and specify different
     ```
 2.  Clone this repository:
     ```bash
-    git clone [URL_OF_YOUR_GITHUB_REPO]
+    git clone https://github.com/BobsBlazed/Bobs-Lora-Loader
     ```
 3.  Restart ComfyUI.
 
