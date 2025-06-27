@@ -1,9 +1,12 @@
 import logging
 from typing import Dict, Any, List
+import os
 
 import comfy.utils
 import comfy.lora
 import folder_paths
+import torch
+from safetensors.torch import load_file as safe_load_file
 
 # -----------------------------------------------------------------------------#
 #                               BLOCK  CONSTANTS                               #
@@ -195,8 +198,14 @@ class BobsLoraLoaderFlux:
         if not lora_path:
             self.logger.error(f"[FLUX] LoRA file not found: {lora_name}")
             return model, clip
-
-        lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        
+        
+        self.logger.info(f"[FLUX] Loading LoRA: {lora_name}")
+        if os.path.splitext(lora_path)[1] == ".safetensors":
+            lora_sd = safe_load_file(lora_path, device="cpu")
+        else:
+            lora_sd = torch.load(lora_path, map_location="cpu")
+        
 
         # -------- build per-block final strengths ----------
         block_strength: Dict[str, float] = {}
@@ -229,7 +238,7 @@ class BobsLoraLoaderFlux:
             module = key_tuple[0]
             raw_key = mod_to_raw.get(module, "")
 
-            # Classify the patch into a concept group
+            
             if not raw_key.startswith("diffusion_model."):
                 concept = "Text Conditioning"
             else:
@@ -254,7 +263,6 @@ class BobsLoraLoaderFlux:
             if strength_for_group == 0.0 or not patches_in_group:
                 continue
             
-            # Apply the patches for this group with the correct strength
             out_model.add_patches(patches_in_group, strength_for_group)
             out_clip.add_patches(patches_in_group, strength_for_group)
 
@@ -262,15 +270,11 @@ class BobsLoraLoaderFlux:
 
 
 # -----------------------------------------------------------------------------#
-#                               SDXL  LOADER                                   #
+#                               SDXL  LOADER (FIXED)                           #
 # -----------------------------------------------------------------------------#
 
 
 class BobsLoraLoaderSdxl:
-    """
-    Unchanged, still relies on comfy.lora.load_lora_for_models_with_block_weights
-    """
-
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -301,7 +305,13 @@ class BobsLoraLoaderSdxl:
             self.logger.error(f"[SDXL] LoRA file not found: {lora_name}")
             return model, clip
 
-        lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        self.logger.info(f"[SDXL] Loading LoRA: {lora_name}")
+        if os.path.splitext(lora_path)[1] == ".safetensors":
+            lora_sd = safe_load_file(lora_path, device="cpu")
+        else:
+            lora_sd = torch.load(lora_path, map_location="cpu")
+        
+        key_map, _ = comfy.lora.model_lora_keys(model, clip)
 
         block_strength: Dict[str, float] = {}
         if preset == "Custom":
@@ -314,11 +324,11 @@ class BobsLoraLoaderSdxl:
             for blk in ALL_SDXL_BLOCKS:
                 block_strength[blk] = weights.get(blk, 1.0) * base
 
-        # This high-level function correctly handles block weights for SDXL
-        model, clip, lora = comfy.lora.load_lora_for_models_with_block_weights(
+        
+        model_new, clip_new = comfy.lora.load_lora_for_models_with_block_weights(
             model, clip, comfy.lora.load_lora(lora_sd, key_map), 1.0, 1.0, block_strength
         )
-        return (model, clip)
+        return (model_new, clip_new)
 
 
 # -----------------------------------------------------------------------------#
