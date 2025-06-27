@@ -1,0 +1,14 @@
+[project]
+name = "Bobs_LoRA_Loader"
+description = "A custom LoRA loader node for ComfyUI with advanced block-weighting controls for both SDXL and FLUX models. Features presets for common use-cases like 'Character' and 'Style', and a 'Custom' mode for fine-grained control over individual model blocks."
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/BobsBlazed/Bobs-Lora-Loader"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "bobsblazed"
+DisplayName = "Bobs_LoRA_Loader"
+Icon = ""
