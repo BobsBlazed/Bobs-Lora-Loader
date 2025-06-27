@@ -1,5 +1,9 @@
 # Bobs LoRA Loader for ComfyUI
 
+|||
+|---|---|
+|![image](https://github.com/user-attachments/assets/7d5ad6ba-30ec-4c6c-8e80-37775bfad7e6)|![image](https://github.com/user-attachments/assets/fca84c9b-211e-41fc-86a9-583e187cd6f1)|
+
 An advanced LoRA loader for ComfyUI that provides granular, block-level control over how a LoRA is applied to both **SDXL** and **FLUX** models.
 
 This node allows you to go beyond a single strength slider and specify different weights for distinct parts of the model, such as the text encoder, the U-Net input blocks, and the output blocks. This is particularly useful for mixing and matching LoRA concepts, strengthening character details while reducing stylistic influence, or vice-versa.
