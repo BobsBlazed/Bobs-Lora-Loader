@@ -8,9 +8,11 @@ import folder_paths
 import torch
 from safetensors.torch import load_file as safe_load_file
 
+
 # -----------------------------------------------------------------------------#
 #                               BLOCK  CONSTANTS                               #
 # -----------------------------------------------------------------------------#
+
 
 FLUX_BLOCK_NAME_MAPPING = {
     "Text Conditioning": ["txt_in."],
@@ -49,9 +51,11 @@ ALL_SDXL_BLOCKS = [
     SDXL_OUTPUT_BLOCKS,
 ]
 
+
 # -----------------------------------------------------------------------------#
 #                             PRESET  DEFINITIONS                              #
 # -----------------------------------------------------------------------------#
+
 
 LORA_BLOCK_PRESETS = {
     "FLUX": {
@@ -163,8 +167,9 @@ LORA_BLOCK_PRESETS = {
     },
 }
 
+
 # -----------------------------------------------------------------------------#
-#                               FLUX  LOADER (FIXED)                           #
+#                               FLUX  LOADER                                   #
 # -----------------------------------------------------------------------------#
 
 
@@ -199,13 +204,11 @@ class BobsLoraLoaderFlux:
             self.logger.error(f"[FLUX] LoRA file not found: {lora_name}")
             return model, clip
         
-        
         self.logger.info(f"[FLUX] Loading LoRA: {lora_name}")
         if os.path.splitext(lora_path)[1] == ".safetensors":
             lora_sd = safe_load_file(lora_path, device="cpu")
         else:
             lora_sd = torch.load(lora_path, map_location="cpu")
-        
 
         # -------- build per-block final strengths ----------
         block_strength: Dict[str, float] = {}
@@ -238,7 +241,7 @@ class BobsLoraLoaderFlux:
             module = key_tuple[0]
             raw_key = mod_to_raw.get(module, "")
 
-            
+            # ------ Classify the patch into a concept group ------
             if not raw_key.startswith("diffusion_model."):
                 concept = "Text Conditioning"
             else:
@@ -270,7 +273,7 @@ class BobsLoraLoaderFlux:
 
 
 # -----------------------------------------------------------------------------#
-#                               SDXL  LOADER (FIXED)                           #
+#                               SDXL  LOADER                                   #
 # -----------------------------------------------------------------------------#
 
 
@@ -311,7 +314,19 @@ class BobsLoraLoaderSdxl:
         else:
             lora_sd = torch.load(lora_path, map_location="cpu")
         
-        key_map, _ = comfy.lora.model_lora_keys(model, clip)
+        # Build key_map compatibly across ComfyUI versions
+        key_map = {}
+        try:
+            # Newer ComfyUI exposes model_lora_keys(model, clip)
+            key_map, _ = comfy.lora.model_lora_keys(model, clip)
+        except AttributeError:
+            # Older ComfyUI: compose map from UNet and CLIP
+            unet = getattr(model, "model", model)
+            clipm = getattr(clip, "cond_stage_model", clip)
+            if hasattr(comfy.lora, "model_lora_keys_unet"):
+                key_map = comfy.lora.model_lora_keys_unet(unet, key_map)
+            if hasattr(comfy.lora, "model_lora_keys_clip"):
+                key_map.update(comfy.lora.model_lora_keys_clip(clipm, {}))
 
         block_strength: Dict[str, float] = {}
         if preset == "Custom":
@@ -324,16 +339,28 @@ class BobsLoraLoaderSdxl:
             for blk in ALL_SDXL_BLOCKS:
                 block_strength[blk] = weights.get(blk, 1.0) * base
 
-        
-        model_new, clip_new = comfy.lora.load_lora_for_models_with_block_weights(
-            model, clip, comfy.lora.load_lora(lora_sd, key_map), 1.0, 1.0, block_strength
-        )
-        return (model_new, clip_new)
+        # Apply with block weights if available; otherwise add patches directly
+        if hasattr(comfy.lora, "load_lora_for_models_with_block_weights"):
+            model_new, clip_new = comfy.lora.load_lora_for_models_with_block_weights(
+                model, clip, comfy.lora.load_lora(lora_sd, key_map), 1.0, 1.0, block_strength
+            )
+            return (model_new, clip_new)
+        else:
+            # Very old fallback
+            patches = comfy.lora.load_lora(lora_sd, key_map)
+            out_model = model.clone()
+            out_clip = clip.clone()
+            # Approximate by applying a single global strength using the middle block weight as a proxy
+            approx_strength = block_strength.get(SDXL_MIDDLE_BLOCK, 1.0)
+            out_model.add_patches(patches, approx_strength)
+            out_clip.add_patches(patches, approx_strength)
+            return out_model, out_clip
 
 
 # -----------------------------------------------------------------------------#
 #                             COMFYUI REGISTRATION                             #
 # -----------------------------------------------------------------------------#
+
 
 NODE_CLASS_MAPPINGS = {
     "BobsLoraLoaderFlux": BobsLoraLoaderFlux,
