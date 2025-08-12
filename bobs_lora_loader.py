@@ -2,13 +2,6 @@
 # Bobs LoRA Loader (SDXL + FLUX) — ComfyUI 0.3.x compatible
 # - SDXL node supports block-weighted LoRA apply (input/middle/output) + Text Encoder strength
 # - FLUX node applies LoRA with fine-grained block controls mapped to Flux module name patterns
-#
-# Uses only public ComfyUI APIs:
-#   - comfy.lora.model_lora_keys / model_lora_keys_unet / model_lora_keys_clip
-#   - comfy.lora.load_lora (returns patch dict)
-#   - ModelPatcher.add_patches(...) and .clone()
-#
-# License: MIT
 
 from __future__ import annotations
 
