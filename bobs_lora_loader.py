@@ -206,14 +206,20 @@ def _example_raws_from_patches(patches: Dict[Tuple[Any, ...], Any],
 # ----------------------------- SDXL grouping -------------------------------- #
 
 def _split_sdxl_patches_by_block(loaded_patches: Dict[Any, Any],
-                                 inv_key_map: Dict[Any, str]):
+                                 inv_key_map: Dict[Any, str],
+                                 logger: logging.Logger):
     """Split patches into SDXL input/middle/output/clip groups based on raw weight names."""
     p_in, p_mid, p_out, p_clip, p_other = {}, {}, {}, {}, {}
     for key_tuple, patch in loaded_patches.items():
         raw_key = inv_key_map.get(key_tuple[0], "")
         rk = raw_key  # permissive contains-checks handle exporter differences
-        if "input_blocks" in rk:
+        
+        # --- MODIFIED SECTION ---
+        # Catch `unet.`-prefixed keys and assign them to Input Blocks
+        if "input_blocks" in rk or "unet." in rk:
             p_in[key_tuple] = patch
+        # --- END MODIFICATION ---
+
         elif "middle_block" in rk:
             p_mid[key_tuple] = patch
         elif "output_blocks" in rk:
@@ -222,6 +228,9 @@ def _split_sdxl_patches_by_block(loaded_patches: Dict[Any, Any],
             p_clip[key_tuple] = patch
         else:
             p_other[key_tuple] = patch
+            # Leave diagnostic logger in place for future troubleshooting
+            if raw_key:
+                logger.warning(f"[SDXL Diagnostics] Unclassified key: {raw_key}")
     return p_in, p_mid, p_out, p_clip, p_other
 
 def _log_sdxl_counts(logger: logging.Logger,
@@ -370,7 +379,7 @@ def _log_flux_counts(logger: logging.Logger,
         total += cnt
         logger.info(f"    - {name}: {cnt} (strength {strengths.get(name, 0.0):.2f})")
     logger.info(f"[FLUX] Total matched patches: {total}")
-
+    
     # Explain zeros
     for name in ALL_FLUX_BLOCKS:
         patches = groups.get(name, {})
@@ -545,7 +554,7 @@ class BobsLoraLoaderSdxl:
             self.logger.warning("[SDXL] No matching keys in LoRA checkpoint.")
             return model, clip
 
-        p_in, p_mid, p_out, p_clip, p_other = _split_sdxl_patches_by_block(all_patches, inv_key_map)
+        p_in, p_mid, p_out, p_clip, p_other = _split_sdxl_patches_by_block(all_patches, inv_key_map, self.logger)
 
         # --- Log counts and zero reasons ---
         _log_sdxl_counts(self.logger, p_in, p_mid, p_out, p_clip, p_other,
