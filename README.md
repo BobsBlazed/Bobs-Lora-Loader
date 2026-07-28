@@ -10,6 +10,7 @@ This node allows you to go beyond a single strength slider and specify different
 
 ## Features
 
+-   **Any Architecture**: A third **Universal** loader covers everything else ComfyUI supports — SD1.5, SD2, SD3/3.5, Chroma, AuraFlow, PixArt, HiDream, Qwen-Image, Wan, LTX-Video, Mochi, HunyuanVideo/DiT, Lumina, Cosmos and more. It discovers the model's block layout at runtime instead of using a hard-coded table, so new and pruned architectures work without an update.
 -   **Dual Model Support**: Separate, optimized loaders for `SDXL` and `FLUX` models, each tailored to the architecture's specific blocks.
 -   **Granular Block-Level Control**: Fine-tune the strength of a LoRA on different conceptual parts of the diffusion model.
 -   **Intelligent Presets**: Comes with pre-configured presets for common use cases like `Character`, `Style`, `Concept`, `Detail & Texture` and `Fix Hands/Anatomy`.
@@ -95,6 +96,50 @@ Ranges below are for the canonical FLUX.1 geometry (19 double-stream blocks, 38 
 | Output Blocks | `output_blocks.*` |
 | Other Tensors | `time_embed`, `label_emb`, `out.*` |
 
+### Universal
+
+The Universal loader works on a single normalised **depth axis**. Almost every
+diffusion backbone is one or more ordered stacks of repeated blocks:
+
+```
+UNet (SD1.5 / SDXL)     input_blocks.N -> middle_block -> output_blocks.N
+Dual-stream DiT (FLUX)  double_blocks.N -> single_blocks.N
+HiDream                 double_stream_blocks.N -> single_stream_blocks.N
+MMDiT (SD3)             joint_blocks.N
+AuraFlow                double_layers.N -> single_layers.N
+Qwen-Image / LTX-Video  transformer_blocks.N
+Wan / Mochi / PixArt    blocks.N
+Lumina                  noise_refiner.N -> context_refiner.N -> layers.N
+```
+
+Those stacks are **discovered from the loaded model**, concatenated in execution
+order, and every block gets a position from 0 to 1 along the result. That axis is
+split into five buckets, so the same five sliders mean the same thing on a
+19+38-block FLUX, a 60-block Qwen-Image and a 20-stage SDXL UNet.
+
+| Block | Covers |
+|---|---|
+| Text Encoder | Every text-encoder weight (CLIP / T5 / LLM) |
+| Input & Embeddings | Patch, timestep, guidance and context embedders |
+| Early Blocks (Composition) | First 20% of the stack |
+| Early-Mid Blocks (Subject) | 20–40% |
+| Mid Blocks (Concept & Style) | 40–60% |
+| Late-Mid Blocks (Detail) | 60–80% |
+| Late Blocks (Texture) | Final 20% |
+| Output Head | Final projection back to latent space |
+| Other Tensors | Anything unmatched (normally empty) |
+
+The `info` output names the detected architecture and the discovered stacks, e.g.
+
+```
+[UNIVERSAL] mylora.safetensors  (preset: Style)
+architecture: QwenImage  transformer_blocks[60]  (total 60)
+```
+
+Use the dedicated FLUX or SDXL loader when you want that architecture's named
+blocks; use Universal for everything else, or when you want one node whose
+sliders behave consistently across models.
+
 ## Why Use Block-Weighted LoRA?
 
 A single LoRA file often contains training for multiple concepts (e.g. a character's face, their clothing, and the overall artistic style). A standard LoRA loader applies the LoRA with one uniform strength across the entire model.
@@ -114,6 +159,47 @@ python -m unittest discover -s tests -v
 ```
 
 ## Changelog
+
+### 1.2.0
+
+**New: a Universal loader covering every architecture ComfyUI supports.**
+
+-   **`Bobs LoRA Loader (Universal)`** handles SD1.5, SD2, SDXL, SD3/3.5, FLUX,
+    Chroma, AuraFlow, PixArt, HiDream, Qwen-Image, Wan, LTX-Video, Mochi,
+    HunyuanVideo/DiT, Lumina, Cosmos and anything else built as stacks of
+    repeated blocks. The block layout is *discovered from the loaded model* —
+    stack names, stack sizes and their execution order — rather than read from a
+    per-family table, so pruned, distilled and brand-new architectures work
+    without a code change.
+-   Weights are assigned along a normalised depth axis (Early → Late), plus
+    embeddings, output head and text encoder, so the same sliders mean the same
+    thing across very different models.
+-   The `info` output now reports the detected architecture and the discovered
+    stacks, e.g. `architecture: QwenImage  transformer_blocks[60]  (total 60)`.
+    The FLUX and SDXL loaders report their architecture too.
+
+**Verified against real ComfyUI.** The classification logic was run against
+models built from ComfyUI's own configs and against its `*_to_diffusers` key
+tables, covering SD1.5, SDXL, SD3, FLUX (full and pruned geometry), AuraFlow,
+PixArt, LTX-Video, Lumina, Qwen-Image and Wan — 8,000+ authentic state-dict
+keys, all classified with none falling through to `Other Tensors`. That pass
+found and fixed several real gaps that synthetic fixtures had missed:
+
+-   SD3 addresses its final block as `joint_blocks.-1`; negative indices are now
+    resolved against the stack size instead of failing to match.
+-   Lumina's `noise_refiner` / `context_refiner` stacks are recognised and
+    ordered ahead of the main `layers` stack.
+-   AuraFlow's native `double_layers` / `single_layers` names are handled, not
+    just the diffusers spelling.
+-   Conditioning embedders that previously fell through — PixArt's `ar_embedder`,
+    `csize_embedder` and `t_block`, LTX-Video's `adaln_single` and
+    `scale_shift_table`, Qwen-Image's `txt_norm`, Wan's `time_projection`,
+    AuraFlow's `cond_seq_linear` / `positional_encoding` — now land in
+    `Input & Embeddings`.
+-   FLUX's ControlNet `pos_embed_input` now maps to `Image Hint`.
+
+Existing FLUX and SDXL workflows are unaffected: no widget was added, removed or
+reordered on those two nodes.
 
 ### 1.1.0
 

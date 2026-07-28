@@ -7,6 +7,7 @@ from .bobs_lora_loader import (
     NODE_DISPLAY_NAME_MAPPINGS,
     BobsLoraLoaderFlux,
     BobsLoraLoaderSdxl,
+    BobsLoraLoaderUniversal,
 )
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "NODE_DISPLAY_NAME_MAPPINGS",
     "BobsLoraLoaderFlux",
     "BobsLoraLoaderSdxl",
+    "BobsLoraLoaderUniversal",
 ]
 
 logging.getLogger("BobsLoraLoader").info(
