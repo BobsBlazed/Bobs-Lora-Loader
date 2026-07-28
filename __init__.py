@@ -1,13 +1,21 @@
-from .bobs_lora_loader import BobsLoraLoaderFlux, BobsLoraLoaderSdxl
+"""Bobs LoRA Loader — block-weighted LoRA loading for ComfyUI (FLUX + SDXL)."""
 
-NODE_CLASS_MAPPINGS = {
-    "BobsLoraLoaderFlux": BobsLoraLoaderFlux,
-    "BobsLoraLoaderSdxl": BobsLoraLoaderSdxl,
-}
+import logging
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "BobsLoraLoaderFlux": "Bobs LoRA Loader (FLUX)",
-    "BobsLoraLoaderSdxl": "Bobs LoRA Loader (SDXL)",
-}
+from .bobs_lora_loader import (
+    NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS,
+    BobsLoraLoaderFlux,
+    BobsLoraLoaderSdxl,
+)
 
-print("✨ Bobs LoRA Loader nodes loaded! ✨")
+__all__ = [
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+    "BobsLoraLoaderFlux",
+    "BobsLoraLoaderSdxl",
+]
+
+logging.getLogger("BobsLoraLoader").info(
+    "Bobs LoRA Loader: %d nodes registered.", len(NODE_CLASS_MAPPINGS)
+)
