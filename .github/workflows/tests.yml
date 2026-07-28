@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unittest:
+    name: Block classification tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # bobs_blocks.py has no ComfyUI or torch dependency, so the mapping logic
+      # is testable on a bare interpreter.
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v

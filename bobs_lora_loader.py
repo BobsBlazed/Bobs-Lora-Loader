@@ -1,580 +1,331 @@
+"""
+Bobs LoRA Loader — block-weighted LoRA loading for ComfyUI (FLUX + SDXL).
+
+How this works
+--------------
+ComfyUI's ``comfy.lora`` builds a ``key_map`` that translates every LoRA
+exporter dialect (kohya ``lora_unet_*``, OneTrainer ``lora_transformer_*``,
+diffusers ``transformer.*``, lycoris, DiffSynth, ...) into the *canonical model
+state-dict key* the patch targets. ``comfy.lora.load_lora`` then returns a patch
+dict keyed by those canonical names — either a plain string, or a
+``(key, offset)`` tuple when several LoRA tensors are packed into one fused
+weight (FLUX ``qkv``/``linear1``).
+
+We therefore classify patches by their canonical target key rather than by the
+raw name inside the LoRA file. That is dialect-proof: if ComfyUI can load the
+LoRA at all, this node can bucket it.
+"""
+
 import logging
-from typing import Dict, Any, List, Tuple
 import os
-import re
+from typing import Any, Dict, List, Optional, Tuple
 
-import comfy.utils
 import comfy.lora
+import comfy.utils
 import folder_paths
-import torch
-from safetensors.torch import load_file as safe_load_file
 
-# -----------------------------------------------------------------------------#
-#                               BLOCK  CONSTANTS                               #
-# -----------------------------------------------------------------------------#
+from .bobs_blocks import (
+    ALL_FLUX_BLOCKS,
+    ALL_SDXL_BLOCKS,
+    BLOCK_TOOLTIPS,
+    FLUX_DEFAULT_DEPTH,
+    FLUX_DEFAULT_DEPTH_SINGLE,
+    LORA_BLOCK_PRESETS,
+    TEXT_ENCODER_BLOCK,
+    classify_flux_key,
+    classify_sdxl_key,
+    flux_block_ranges,
+    resolve_block_strengths,
+)
 
-# FLUX conceptual blocks. We support BOTH:
-# - model-style module paths: double_blocks.*, single_blocks.*, *_in, final_layer
-# - LoRA-exporter-style keys: lora_transformer_(single_)?transformer_blocks_<n>_*
-FLUX_BLOCK_NAME_MAPPING: Dict[str, List[str]] = {
-    "Text Conditioning": ["txt_in."],
-    "Timestep Embedding": ["time_in."],
-    "Image Hint": ["img_in."],
-    "Guidance Embedding": ["guidance_in."],
-    "Vector Embedding": ["vector_in."],
-    # Down path (model-style tokens)
-    "Early Downsampling (Composition)": [f"double_blocks.{i}." for i in range(0, 4)],
-    "Mid Downsampling (Subject & Concept)": [f"double_blocks.{i}." for i in range(4, 8)],
-    "Late Downsampling (Refinement)": [f"double_blocks.{i}." for i in range(8, 10)],
-    # Core stack (model-style tokens)
-    "Core/Middle Block (Style Focus)": (
-        [f"single_blocks.{i}." for i in range(0, 8)] +
-        [f"double_blocks.{i}." for i in range(10, 19)]
-    ),
-    # Up path (model-style tokens)
-    "Early Upsampling (Initial Style)": [f"double_blocks.{i}." for i in range(19, 23)] +
-                                        [f"single_blocks.{i}." for i in range(8, 16)],
-    "Mid Upsampling (Detail Generation)": [f"double_blocks.{i}." for i in range(23, 27)] +
-                                        [f"single_blocks.{i}." for i in range(16, 32)],
-    "Late Upsampling (Final Textures)": [f"double_blocks.{i}." for i in range(27, 29)] +
-                                        [f"single_blocks.{i}." for i in range(32, 38)],
-    # Output head
-    "Final Output Layer (Latent Projection)": ["final_layer."],
-    "Other Tensors": [],
-}
-ALL_FLUX_BLOCKS = list(FLUX_BLOCK_NAME_MAPPING.keys())
+try:  # Added to ComfyUI in 2025; handles BFL-control / Wan-Fun / USO LoRAs.
+    import comfy.lora_convert as _lora_convert
+except ImportError:  # pragma: no cover - older ComfyUI
+    _lora_convert = None
 
-# SDXL blocks (coarse sliders)
-SDXL_TEXT_ENCODER = "Text Encoder"
-SDXL_INPUT_BLOCKS = "Input Blocks"
-SDXL_MIDDLE_BLOCK = "Middle Block"
-SDXL_OUTPUT_BLOCKS = "Output Blocks"
-ALL_SDXL_BLOCKS = [
-    SDXL_TEXT_ENCODER,
-    SDXL_INPUT_BLOCKS,
-    SDXL_MIDDLE_BLOCK,
-    SDXL_OUTPUT_BLOCKS,
-]
+logger = logging.getLogger("BobsLoraLoader")
 
-# -----------------------------------------------------------------------------#
-#                             PRESET  DEFINITIONS                              #
-# -----------------------------------------------------------------------------#
+MAX_STRENGTH = 5.0
+MAX_BLOCK_WEIGHT = 2.0
 
-LORA_BLOCK_PRESETS = {
-    "FLUX": {
-        "Custom": {},
-        "Full (Normal LoRA)": {
-            "strength": 1.0,
-            "block_weights": {name: 1.0 for name in ALL_FLUX_BLOCKS},
-        },
-        "Character": {
-            "strength": 1.0,
-            "block_weights": {
-                "Text Conditioning": 1.0,
-                "Early Downsampling (Composition)": 0.6,
-                "Mid Downsampling (Subject & Concept)": 1.0,
-                "Late Downsampling (Refinement)": 0.4,
-                "Core/Middle Block (Style Focus)": 1.0,
-                "Early Upsampling (Initial Style)": 0.1,
-                "Mid Upsampling (Detail Generation)": 0.0,
-                "Late Upsampling (Final Textures)": 0.0,
-                "Final Output Layer (Latent Projection)": 0.0,
-            },
-        },
-        "Style": {
-            "strength": 1.0,
-            "block_weights": {
-                "Text Conditioning": 0.2,
-                "Early Downsampling (Composition)": 0.1,
-                "Mid Downsampling (Subject & Concept)": 0.0,
-                "Late Downsampling (Refinement)": 0.2,
-                "Core/Middle Block (Style Focus)": 0.5,
-                "Early Upsampling (Initial Style)": 1.0,
-                "Mid Upsampling (Detail Generation)": 1.0,
-                "Late Upsampling (Final Textures)": 1.0,
-                "Final Output Layer (Latent Projection)": 1.0,
-            },
-        },
-        "Concept": {
-            "strength": 1.0,
-            "block_weights": {
-                "Text Conditioning": 1.0,
-                "Early Downsampling (Composition)": 1.0,
-                "Mid Downsampling (Subject & Concept)": 0.9,
-                "Late Downsampling (Refinement)": 0.6,
-                "Core/Middle Block (Style Focus)": 0.7,
-                "Early Upsampling (Initial Style)": 0.5,
-                "Mid Upsampling (Detail Generation)": 0.3,
-                "Late Upsampling (Final Textures)": 0.1,
-                "Final Output Layer (Latent Projection)": 0.0,
-            },
-        },
-        "Fix Hands/Anatomy": {
-            "strength": 0.4,
-            "block_weights": {
-                "Text Conditioning": 0.2,
-                "Early Downsampling (Composition)": 1.0,
-                "Mid Downsampling (Subject & Concept)": 0.3,
-                "Late Downsampling (Refinement)": 0.0,
-                "Core/Middle Block (Style Focus)": 0.0,
-                "Early Upsampling (Initial Style)": 0.0,
-                "Mid Upsampling (Detail Generation)": 0.0,
-                "Late Upsampling (Final Textures)": 0.0,
-                "Final Output Layer (Latent Projection)": 0.0,
-            },
-        },
-    },
-
-    "SDXL": {
-        "Custom": {},
-        "Full (Normal LoRA)": {
-            "strength": 1.0,
-            "block_weights": {b: 1.0 for b in ALL_SDXL_BLOCKS},
-        },
-        "Character": {
-            "strength": 1.0,
-            "block_weights": {
-                SDXL_TEXT_ENCODER: 1.0,
-                SDXL_INPUT_BLOCKS: 1.0,
-                SDXL_MIDDLE_BLOCK: 1.0,
-                SDXL_OUTPUT_BLOCKS: 0.2,
-            },
-        },
-        "Style": {
-            "strength": 1.0,
-            "block_weights": {
-                SDXL_TEXT_ENCODER: 0.0,
-                SDXL_INPUT_BLOCKS: 0.2,
-                SDXL_MIDDLE_BLOCK: 0.5,
-                SDXL_OUTPUT_BLOCKS: 1.0,
-            },
-        },
-        "Concept": {
-            "strength": 1.0,
-            "block_weights": {
-                SDXL_TEXT_ENCODER: 1.0,
-                SDXL_INPUT_BLOCKS: 0.8,
-                SDXL_MIDDLE_BLOCK: 0.7,
-                SDXL_OUTPUT_BLOCKS: 0.5,
-            },
-        },
-        "Fix Hands/Anatomy": {
-            "strength": 0.4,
-            "block_weights": {
-                SDXL_TEXT_ENCODER: 0.2,
-                SDXL_INPUT_BLOCKS: 1.0,
-                SDXL_MIDDLE_BLOCK: 0.4,
-                SDXL_OUTPUT_BLOCKS: 0.0,
-            },
-        },
-    },
-}
 
 # -----------------------------------------------------------------------------#
 #                               HELPER FUNCTIONS                               #
 # -----------------------------------------------------------------------------#
 
-def _build_key_map(model, clip) -> Dict[str, Any]:
-    """Build key_map compatibly across ComfyUI versions."""
-    key_map: Dict[str, Any] = {}
-    if hasattr(comfy.lora, "model_lora_keys_unet"):
-        comfy.lora.model_lora_keys_unet(model.model, key_map)
-    if hasattr(comfy.lora, "model_lora_keys_clip"):
-        comfy.lora.model_lora_keys_clip(clip.cond_stage_model, key_map)
-    return key_map
+def _patch_target(patch_key: Any) -> str:
+    """Return the model state-dict key a patch entry targets.
 
-def _invert_key_map(key_map: Dict[str, Any]) -> Dict[Any, str]:
-    """Invert key_map from raw_name -> (module, ...) to (module) -> raw_name."""
-    inv: Dict[Any, str] = {}
-    for raw, info in key_map.items():
-        inv[info[0]] = raw  # info[0] is the nn.Module
-    return inv
-
-def _example_raws_from_patches(patches: Dict[Tuple[Any, ...], Any],
-                               inv_key_map: Dict[Any, str],
-                               limit: int = 3) -> List[str]:
-    out: List[str] = []
-    for key_tuple in patches.keys():
-        mod = key_tuple[0]
-        raw = inv_key_map.get(mod, "")
-        if raw:
-            out.append(raw.split(".", 1)[-1])
-        if len(out) >= limit:
-            break
-    return out
-
-# ----------------------------- SDXL grouping -------------------------------- #
-
-def _split_sdxl_patches_by_block(loaded_patches: Dict[Any, Any],
-                                 inv_key_map: Dict[Any, str],
-                                 logger: logging.Logger):
-    """Split patches into SDXL input/middle/output/clip groups based on raw weight names."""
-    p_in, p_mid, p_out, p_clip, p_other = {}, {}, {}, {}, {}
-    for key_tuple, patch in loaded_patches.items():
-        raw_key = inv_key_map.get(key_tuple[0], "")
-        rk = raw_key  # permissive contains-checks handle exporter differences
-        
-        # --- MODIFIED SECTION ---
-        # Catch `unet.`-prefixed keys and assign them to Input Blocks
-        if "input_blocks" in rk or "unet." in rk:
-            p_in[key_tuple] = patch
-        # --- END MODIFICATION ---
-
-        elif "middle_block" in rk:
-            p_mid[key_tuple] = patch
-        elif "output_blocks" in rk:
-            p_out[key_tuple] = patch
-        elif ("text_encoder" in rk) or ("lora_te" in rk) or ("clip" in rk and "proj" in rk):
-            p_clip[key_tuple] = patch
-        else:
-            p_other[key_tuple] = patch
-            # Leave diagnostic logger in place for future troubleshooting
-            if raw_key:
-                logger.warning(f"[SDXL Diagnostics] Unclassified key: {raw_key}")
-    return p_in, p_mid, p_out, p_clip, p_other
-
-def _log_sdxl_counts(logger: logging.Logger,
-                     p_in: Dict[Any, Any], p_mid: Dict[Any, Any],
-                     p_out: Dict[Any, Any], p_clip: Dict[Any, Any],
-                     p_other: Dict[Any, Any],
-                     te_strength: float, in_strength: float,
-                     mid_strength: float, out_strength: float,
-                     inv_key_map: Dict[Any, str]):
-    cnt_te = len(p_clip)
-    cnt_in = len(p_in)
-    cnt_mid = len(p_mid)
-    cnt_out = len(p_out)
-    cnt_other = len(p_other)
-    logger.info(
-        f"[SDXL] Patch counts — TE:{cnt_te} IN:{cnt_in} MID:{cnt_mid} OUT:{cnt_out} OTHER:{cnt_other} "
-        f"| strengths TE={te_strength:.2f} IN={in_strength:.2f} MID={mid_strength:.2f} OUT={out_strength:.2f}"
-    )
-
-    def _why_zero(name: str, cnt: int, strength: float, sample_from: Dict[Any, Any]):
-        if cnt > 0:
-            return
-        if strength == 0.0:
-            logger.info(f"[SDXL] {name}: 0 patches applied because strength is 0.00.")
-        else:
-            examples = _example_raws_from_patches(sample_from, inv_key_map, 3)
-            logger.info(
-                f"[SDXL] {name}: 0 patches found in this LoRA (strength {strength:.2f} > 0). "
-                f"Likely the LoRA was trained without deltas for this block.\n"
-                f"Counts — TE:{cnt_te} IN:{cnt_in} MID:{cnt_mid} OUT:{cnt_out} OTHER:{cnt_other}. "
-                f"Example raw tails present: {examples}"
-            )
-
-    sample_source = {}
-    for d in (p_in, p_mid, p_out, p_clip, p_other):
-        if len(d) > len(sample_source):
-            sample_source = d
-
-    _why_zero("Input Blocks", cnt_in, in_strength, sample_source)
-    _why_zero("Middle Block", cnt_mid, mid_strength, sample_source)
-    _why_zero("Output Blocks", cnt_out, out_strength, sample_source)
-
-# ----------------------------- FLUX grouping -------------------------------- #
-
-# Normalize keys to underscore style, then regex them.
-def _normalize_key(key: str) -> str:
-    """Lowercase and replace separators with underscores for uniform matching."""
-    k = key.replace("/", "_").replace(".", "_").replace(":", "_").lower()
-    k = re.sub(r"__+", "_", k)
-    return k
-
-# Heuristic splitter for Flux exporter keys (plus model-style).
-# Matches variations like:
-#   transformer_blocks_<IDX>_...
-#   lora_transformer_transformer_blocks_<IDX>_...
-#   single_transformer_blocks_<IDX>_...
-#   lora_transformer_single_transformer_blocks_<IDX>_...
-# And also model-style paths like:
-#   double_blocks.<i>.
-#   single_blocks.<i>.
-_RE_TX_BLOCK_US = re.compile(r"(?:^|_)(?:lora_transformer_)?transformer_blocks_(\d+)(?:_|$)")
-_RE_SINGLE_TX_BLOCK_US = re.compile(r"(?:^|_)(?:lora_transformer_)?single_transformer_blocks_(\d+)(?:_|$)")
-_RE_DOUBLE_BLOCKS_US = re.compile(r"(?:^|_)(?:lora_transformer_)?double_blocks_(\d+)(?:_|$)")
-_RE_SINGLE_BLOCKS_US = re.compile(r"(?:^|_)(?:lora_transformer_)?single_blocks_(\d+)(?:_|$)")
-
-def _flux_concept_from_raw(raw_key: str) -> str:
+    ``load_lora`` keys are either the key itself or ``(key, offset)`` for
+    patches into a slice of a fused weight — the same shape ``ModelPatcher.
+    add_patches`` unpacks.
     """
-    Map a raw module key to a conceptual FLUX block. Supports both:
-      - model-style paths (double_blocks.*, single_blocks.*, *_in, final_layer)
-      - LoRA-exporter-style names (transformer_blocks_#, single_transformer_blocks_#)
+    return patch_key if isinstance(patch_key, str) else patch_key[0]
+
+
+def _build_key_maps(model, clip) -> Tuple[Dict[str, Any], set]:
+    """Build ComfyUI's LoRA key map and the set of keys owned by the UNet.
+
+    Returning the UNet key set is what lets us route text-encoder patches to the
+    CLIP patcher and everything else to the model patcher without guessing from
+    key names.
     """
-    rk_norm = _normalize_key(raw_key)
+    unet_map: Dict[str, Any] = {}
+    clip_map: Dict[str, Any] = {}
 
-    # Inlet/head tokens (string contains checks on normalized)
-    if "_txt_in" in rk_norm or "time_text_embed" in rk_norm: return "Text Conditioning"
-    if "_time_in" in rk_norm: return "Timestep Embedding"
-    if "_img_in" in rk_norm: return "Image Hint"
-    if "_guidance_in" in rk_norm: return "Guidance Embedding"
-    if "_vector_in" in rk_norm: return "Vector Embedding"
-    if "_final_layer" in rk_norm: return "Final Output Layer (Latent Projection)"
+    if model is not None and hasattr(comfy.lora, "model_lora_keys_unet"):
+        comfy.lora.model_lora_keys_unet(model.model, unet_map)
+    if clip is not None and hasattr(comfy.lora, "model_lora_keys_clip"):
+        comfy.lora.model_lora_keys_clip(clip.cond_stage_model, clip_map)
 
-    # LoRA-exporter: single_transformer_blocks_*
-    m_single_tx = _RE_SINGLE_TX_BLOCK_US.search(rk_norm)
-    if m_single_tx:
-        idx = int(m_single_tx.group(1))
-        if 0 <= idx < 8: return "Core/Middle Block (Style Focus)"
-        if 8 <= idx < 16: return "Early Upsampling (Initial Style)"
-        if 16 <= idx < 32: return "Mid Upsampling (Detail Generation)"
-        if 32 <= idx < 38: return "Late Upsampling (Final Textures)"
+    key_map = dict(clip_map)
+    key_map.update(unet_map)  # UNet wins on the (unlikely) collision
+    unet_targets = {_patch_target(v) for v in unet_map.values()}
+    return key_map, unet_targets
 
-    # Model-style single_blocks
-    m_sb = _RE_SINGLE_BLOCKS_US.search(rk_norm)
-    if m_sb:
-        idx = int(m_sb.group(1))
-        if 0 <= idx < 8: return "Core/Middle Block (Style Focus)"
-        if 8 <= idx < 16: return "Early Upsampling (Initial Style)"
-        if 16 <= idx < 32: return "Mid Upsampling (Detail Generation)"
-        if 32 <= idx < 38: return "Late Upsampling (Final Textures)"
 
-    # Model-style double_blocks indices
-    m_db = _RE_DOUBLE_BLOCKS_US.search(rk_norm)
-    if m_db:
-        idx = int(m_db.group(1))
-        if 0 <= idx < 4:  return "Early Downsampling (Composition)"
-        if 4 <= idx < 8:  return "Mid Downsampling (Subject & Concept)"
-        if 8 <= idx < 10:  return "Late Downsampling (Refinement)"
-        if 10 <= idx < 19: return "Core/Middle Block (Style Focus)"
-        if 19 <= idx < 23: return "Early Upsampling (Initial Style)"
-        if 23 <= idx < 27: return "Mid Upsampling (Detail Generation)"
-        if 27 <= idx < 29: return "Late Upsampling (Final Textures)"
+def _flux_geometry(model) -> Tuple[int, int]:
+    """Read the double/single stream depths off the loaded FLUX model."""
+    try:
+        config = model.model.model_config.unet_config
+        depth = int(config.get("depth", 0)) or FLUX_DEFAULT_DEPTH
+        depth_single = int(config.get("depth_single_blocks", 0)) or FLUX_DEFAULT_DEPTH_SINGLE
+        return depth, depth_single
+    except Exception:  # noqa: BLE001 - any unexpected config shape falls back
+        return FLUX_DEFAULT_DEPTH, FLUX_DEFAULT_DEPTH_SINGLE
 
-    # LoRA-exporter: transformer_blocks_IDX => map ranges (double path)
-    m_tx = _RE_TX_BLOCK_US.search(rk_norm)
-    if m_tx:
-        idx = int(m_tx.group(1))
-        if 0 <= idx < 4:  return "Early Downsampling (Composition)"
-        if 4 <= idx < 8:  return "Mid Downsampling (Subject & Concept)"
-        if 8 <= idx < 10:  return "Late Downsampling (Refinement)"
-        if 10 <= idx < 19: return "Core/Middle Block (Style Focus)"
-        if 19 <= idx < 23: return "Early Upsampling (Initial Style)"
-        if 23 <= idx < 27: return "Mid Upsampling (Detail Generation)"
-        if 27 <= idx < 29: return "Late Upsampling (Final Textures)"
 
-    return "Other Tensors"
+def _format_report(tag: str,
+                   lora_name: str,
+                   preset: str,
+                   blocks: List[str],
+                   grouped: Dict[str, Dict[Any, Any]],
+                   strengths: Dict[str, float],
+                   applied: Dict[str, int]) -> str:
+    lines = [f"[{tag}] {lora_name}  (preset: {preset})",
+             f"{'block':<40} {'weight':>7} {'found':>7} {'applied':>8}"]
+    for name in blocks:
+        lines.append(
+            f"{name:<40} {strengths.get(name, 0.0):>7.2f} "
+            f"{len(grouped.get(name, {})):>7} {applied.get(name, 0):>8}"
+        )
+    total_found = sum(len(g) for g in grouped.values())
+    total_applied = sum(applied.values())
+    lines.append(f"{'TOTAL':<40} {'':>7} {total_found:>7} {total_applied:>8}")
+    return "\n".join(lines)
 
-def _group_flux_patches(loaded_patches: Dict[Any, Any],
-                        inv_key_map: Dict[Any, str]) -> Dict[str, Dict[Any, Any]]:
-    groups = {name: {} for name in ALL_FLUX_BLOCKS}
-    for key_tuple, patch in loaded_patches.items():
-        raw_key = inv_key_map.get(key_tuple[0], "")
-        concept = _flux_concept_from_raw(raw_key) if raw_key else "Other Tensors"
-        if concept in groups:
-            groups[concept][key_tuple] = patch
-        else:
-            groups["Other Tensors"][key_tuple] = patch
-    return groups
 
-def _log_flux_counts(logger: logging.Logger,
-                     groups: Dict[str, Dict[Any, Any]],
-                     strengths: Dict[str, float],
-                     inv_key_map: Dict[Any, str]):
-    logger.info("[FLUX] Patch counts per block:")
-    total = 0
-    for name in ALL_FLUX_BLOCKS:
-        cnt = len(groups.get(name, {}))
-        total += cnt
-        logger.info(f"    - {name}: {cnt} (strength {strengths.get(name, 0.0):.2f})")
-    logger.info(f"[FLUX] Total matched patches: {total}")
-    
-    # Explain zeros
-    for name in ALL_FLUX_BLOCKS:
-        patches = groups.get(name, {})
-        strength = strengths.get(name, 0.0)
-        if len(patches) > 0:
+def _explain_empty_blocks(tag: str,
+                          blocks: List[str],
+                          grouped: Dict[str, Dict[Any, Any]],
+                          strengths: Dict[str, float]) -> None:
+    """Log why a block with a non-zero weight contributed nothing."""
+    for name in blocks:
+        if grouped.get(name) or strengths.get(name, 0.0) == 0.0:
             continue
+        logger.info(
+            "[%s] %s: weight %.2f but this LoRA contains no tensors for that block.",
+            tag, name, strengths[name],
+        )
+
+
+# -----------------------------------------------------------------------------#
+#                                 SHARED  NODE                                 #
+# -----------------------------------------------------------------------------#
+
+class _BobsLoraLoaderBase:
+    """Shared load / classify / patch pipeline for the FLUX and SDXL loaders."""
+
+    FAMILY = "FLUX"
+    BLOCKS: List[str] = ALL_FLUX_BLOCKS
+
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "info")
+    OUTPUT_TOOLTIPS = (
+        "Model with the block-weighted LoRA applied.",
+        "CLIP with the text-encoder portion of the LoRA applied.",
+        "Per-block report: weight, tensors found and tensors actually patched.",
+    )
+    FUNCTION = "apply_lora"
+    CATEGORY = "Bobs_Nodes"
+
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._cache_key: Optional[tuple] = None
+        self._cache_sd: Optional[Dict[str, Any]] = None
+
+    # ---------------------------------------------------------------- inputs --
+
+    @classmethod
+    def _input_types(cls) -> Dict[str, Any]:
+        required = {
+            "model": ("MODEL", {"tooltip": "Diffusion model to patch."}),
+            "lora_name": (
+                ["None"] + folder_paths.get_filename_list("loras"),
+                {"tooltip": "LoRA file to load. 'None' passes the model through untouched."},
+            ),
+            "strength": ("FLOAT", {
+                "default": 1.0, "min": -MAX_STRENGTH, "max": MAX_STRENGTH, "step": 0.01,
+                "tooltip": "Global multiplier applied on top of every block weight.",
+            }),
+            "preset": (
+                list(LORA_BLOCK_PRESETS[cls.FAMILY].keys()),
+                {"tooltip": "Choose 'Custom' to use the sliders below; any other preset overrides them."},
+            ),
+        }
+        for block in cls.BLOCKS:
+            required[block] = ("FLOAT", {
+                "default": 1.0, "min": -MAX_BLOCK_WEIGHT, "max": MAX_BLOCK_WEIGHT, "step": 0.05,
+                "tooltip": BLOCK_TOOLTIPS.get(block, block),
+            })
+        return {
+            "required": required,
+            "optional": {
+                "clip": ("CLIP", {"tooltip": "Optional. Leave unconnected to patch the model only."}),
+            },
+        }
+
+    # ------------------------------------------------------------ lora  file --
+
+    def _load_lora_state_dict(self, lora_path: str) -> Dict[str, Any]:
+        """Load a LoRA, reusing the previous load when the file is unchanged."""
+        try:
+            stat = os.stat(lora_path)
+            cache_key = (lora_path, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = None
+
+        if cache_key is not None and cache_key == self._cache_key:
+            return self._cache_sd
+
+        # load_torch_file handles .safetensors and pickled checkpoints, and
+        # applies weights_only=True to the latter.
+        state_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        if _lora_convert is not None:
+            state_dict = _lora_convert.convert_lora(state_dict)
+
+        self._cache_key, self._cache_sd = cache_key, state_dict
+        return state_dict
+
+    # ------------------------------------------------------------ classifier --
+
+    def _classifier(self, model):
+        """Return ``fn(model_state_dict_key) -> block name`` for this family."""
+        raise NotImplementedError
+
+    # ----------------------------------------------------------------- apply --
+
+    def apply_lora(self, model, lora_name, strength, preset, clip=None, **kwargs):
+        tag = self.FAMILY
+
+        if lora_name in (None, "", "None"):
+            return (model, clip, f"[{tag}] no LoRA selected.")
         if strength == 0.0:
-            logger.info(f"[FLUX] {name}: 0 patches applied because strength is 0.00.")
-        else:
-            # Use the largest non-empty group as a sample source
-            non_empty = [(k, v) for k, v in groups.items() if len(v) > 0]
-            sample = non_empty[0][1] if non_empty else {}
-            examples = _example_raws_from_patches(sample, inv_key_map, 3)
-            logger.info(
-                f"[FLUX] {name}: 0 patches in this LoRA (strength {strength:.2f} > 0). "
-                f"LoRA likely doesn't include weights for this block. "
-                f"Sample mapped raw tails: {examples}"
-            )
-            
+            return (model, clip, f"[{tag}] {lora_name}: strength is 0.00, nothing applied.")
+
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        if not lora_path:
+            message = f"[{tag}] LoRA file not found: {lora_name}"
+            self.logger.error(message)
+            return (model, clip, message)
+
+        try:
+            lora_sd = self._load_lora_state_dict(lora_path)
+        except Exception as exc:  # noqa: BLE001 - surface, never crash the graph
+            message = f"[{tag}] failed to read {lora_name}: {exc}"
+            self.logger.error(message)
+            return (model, clip, message)
+
+        strengths = resolve_block_strengths(self.FAMILY, preset, strength, kwargs)
+
+        key_map, unet_targets = _build_key_maps(model, clip)
+        if not key_map:
+            message = f"[{tag}] could not build a key map for this model; LoRA not applied."
+            self.logger.warning(message)
+            return (model, clip, message)
+
+        all_patches = comfy.lora.load_lora(lora_sd, key_map)
+        if not all_patches:
+            message = (f"[{tag}] {lora_name}: none of its tensors match this model. "
+                       f"Is it a LoRA for a different architecture?")
+            self.logger.warning(message)
+            return (model, clip, message)
+
+        # Group UNet patches per conceptual block; CLIP patches all share the
+        # text-encoder block.
+        classify = self._classifier(model)
+        text_encoder_block = TEXT_ENCODER_BLOCK[self.FAMILY]
+        grouped: Dict[str, Dict[Any, Any]] = {name: {} for name in self.BLOCKS}
+
+        for patch_key, patch in all_patches.items():
+            target = _patch_target(patch_key)
+            block = classify(target) if target in unet_targets else text_encoder_block
+            grouped[block][patch_key] = patch
+
+        out_model = model.clone() if model is not None else None
+        out_clip = clip.clone() if clip is not None else None
+
+        applied: Dict[str, int] = {}
+        for name in self.BLOCKS:
+            patches = grouped[name]
+            block_strength = strengths.get(name, 0.0)
+            patcher = out_clip if name == text_encoder_block else out_model
+            if not patches or block_strength == 0.0 or patcher is None:
+                applied[name] = 0
+                continue
+            applied[name] = len(patcher.add_patches(patches, block_strength))
+
+        # Any tensor in the file that ComfyUI could not place is reported by
+        # comfy.lora.load_lora itself as a "lora key not loaded" warning.
+        report = _format_report(tag, lora_name, preset, self.BLOCKS,
+                                grouped, strengths, applied)
+        self.logger.info("\n%s", report)
+        _explain_empty_blocks(tag, self.BLOCKS, grouped, strengths)
+
+        return (out_model, out_clip, report)
+
+
 # -----------------------------------------------------------------------------#
 #                               FLUX  LOADER                                   #
 # -----------------------------------------------------------------------------#
 
-class BobsLoraLoaderFlux:
-    def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
+class BobsLoraLoaderFlux(_BobsLoraLoaderBase):
+    FAMILY = "FLUX"
+    BLOCKS = ALL_FLUX_BLOCKS
+    DESCRIPTION = (
+        "Applies a LoRA to a FLUX model with an independent weight per conceptual "
+        "block (composition, subject, style core, detail, texture, text encoder). "
+        "Block ranges are derived from the loaded model's own depth, so FLUX.1 "
+        "dev/schnell and pruned variants are all handled."
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
-        req = {
-            "model": ("MODEL",),
-            "clip": ("CLIP",),
-            "lora_name": (["None"] + folder_paths.get_filename_list("loras"),),
-            "strength": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.01}),
-            "preset": (list(LORA_BLOCK_PRESETS["FLUX"].keys()),),
-        }
-        for blk in ALL_FLUX_BLOCKS:
-            req[blk] = ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05})
-        return {"required": req}
+        return cls._input_types()
 
-    RETURN_TYPES = ("MODEL", "CLIP")
-    FUNCTION = "apply_lora"
-    CATEGORY = "Bobs_Nodes"
-
-    def apply_lora(self, model, clip, lora_name, strength, preset, **kwargs):
-
-        if lora_name == "None" or strength == 0.0:
-            return model, clip
-
-        lora_path = folder_paths.get_full_path("loras", lora_name)
-        if not lora_path:
-            self.logger.error(f"[FLUX] LoRA file not found: {lora_name}")
-            return model, clip
-
-        self.logger.info(f"[FLUX] Loading LoRA: {lora_name}")
-        if os.path.splitext(lora_path)[1].lower() == ".safetensors":
-            lora_sd = safe_load_file(lora_path, device="cpu")
-        else:
-            lora_sd = torch.load(lora_path, map_location="cpu")
-
-        # -------- build per-block final strengths ----------
-        block_strength: Dict[str, float] = {}
-        if preset == "Custom":
-            for blk in ALL_FLUX_BLOCKS:
-                block_strength[blk] = float(kwargs.get(blk, 1.0)) * float(strength)
-        else:
-            cfg = LORA_BLOCK_PRESETS["FLUX"][preset]
-            base = float(strength) * float(cfg.get("strength", 1.0))
-            weights = cfg.get("block_weights", {})
-            for blk in ALL_FLUX_BLOCKS:
-                block_strength[blk] = float(weights.get(blk, 1.0)) * base
-
-        # -------- build key map & load patches -------------
-        key_map: Dict[str, Any] = _build_key_map(model, clip)
-        if not key_map:
-            self.logger.warning("[FLUX] Empty key_map; LoRA will not be applied.")
-            return model, clip
-
-        inv_key_map = _invert_key_map(key_map)
-        all_patches = comfy.lora.load_lora(lora_sd, key_map)
-
-        if not all_patches:
-            self.logger.warning("[FLUX] No matching keys in LoRA checkpoint.")
-            return model, clip
-
-        grouped_patches = _group_flux_patches(all_patches, inv_key_map)
-
-        # -------- logging: counts & explanations -----------
-        _log_flux_counts(self.logger, grouped_patches, block_strength, inv_key_map)
-
-        # -------- clone & attach patches group by group ----
-        out_model = model.clone()
-        out_clip = clip.clone()
-
-        for concept, patches_in_group in grouped_patches.items():
-            s = block_strength.get(concept, 0.0)
-            if s == 0.0 or not patches_in_group:
-                continue
-            # Apply to both model and clip; non-matching targets are no-ops
-            out_model.add_patches(patches_in_group, s)
-            out_clip.add_patches(patches_in_group, s)
-
-        return out_model, out_clip
+    def _classifier(self, model):
+        ranges = flux_block_ranges(*_flux_geometry(model))
+        return lambda key: classify_flux_key(key, ranges)
 
 
 # -----------------------------------------------------------------------------#
 #                               SDXL  LOADER                                   #
 # -----------------------------------------------------------------------------#
 
-class BobsLoraLoaderSdxl:
-    def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
+class BobsLoraLoaderSdxl(_BobsLoraLoaderBase):
+    FAMILY = "SDXL"
+    BLOCKS = ALL_SDXL_BLOCKS
+    DESCRIPTION = (
+        "Applies a LoRA to an SDXL model with independent weights for the text "
+        "encoder and the UNet input / middle / output stages."
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
-        req = {
-            "model": ("MODEL",),
-            "clip": ("CLIP",),
-            "lora_name": (["None"] + folder_paths.get_filename_list("loras"),),
-            "strength": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.01}),
-            "preset": (list(LORA_BLOCK_PRESETS["SDXL"].keys()),),
-        }
-        for blk in ALL_SDXL_BLOCKS:
-            req[blk] = ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05})
-        return {"required": req}
+        return cls._input_types()
 
-    RETURN_TYPES = ("MODEL", "CLIP")
-    FUNCTION = "apply_lora"
-    CATEGORY = "Bobs_Nodes"
-
-    def apply_lora(self, model, clip, lora_name, strength, preset, **kwargs):
-
-        if lora_name == "None" or strength == 0.0:
-            return model, clip
-
-        lora_path = folder_paths.get_full_path("loras", lora_name)
-        if not lora_path:
-            self.logger.error(f"[SDXL] LoRA file not found: {lora_name}")
-            return model, clip
-
-        self.logger.info(f"[SDXL] Loading LoRA: {lora_name}")
-        if os.path.splitext(lora_path)[1].lower() == ".safetensors":
-            lora_sd = safe_load_file(lora_path, device="cpu")
-        else:
-            lora_sd = torch.load(lora_path, map_location="cpu")
-
-        # --- Build block strengths ---
-        if preset == "Custom":
-            te_strength = float(kwargs.get(SDXL_TEXT_ENCODER, 1.0)) * float(strength)
-            in_strength = float(kwargs.get(SDXL_INPUT_BLOCKS, 1.0)) * float(strength)
-            mid_strength = float(kwargs.get(SDXL_MIDDLE_BLOCK, 1.0)) * float(strength)
-            out_strength = float(kwargs.get(SDXL_OUTPUT_BLOCKS, 1.0)) * float(strength)
-        else:
-            cfg = LORA_BLOCK_PRESETS["SDXL"][preset]
-            base = float(strength) * float(cfg.get("strength", 1.0))
-            weights = cfg.get("block_weights", {})
-            te_strength  = float(weights.get(SDXL_TEXT_ENCODER, 1.0)) * base
-            in_strength  = float(weights.get(SDXL_INPUT_BLOCKS, 1.0)) * base
-            mid_strength = float(weights.get(SDXL_MIDDLE_BLOCK, 1.0)) * base
-            out_strength = float(weights.get(SDXL_OUTPUT_BLOCKS, 1.0)) * base
-
-        # --- Build key map for model and clip ---
-        key_map: Dict[str, Any] = _build_key_map(model, clip)
-        if not key_map:
-            self.logger.warning("[SDXL] Empty key_map; LoRA will not be applied.")
-            return model, clip
-
-        inv_key_map = _invert_key_map(key_map)
-        all_patches = comfy.lora.load_lora(lora_sd, key_map)
-
-        if not all_patches:
-            self.logger.warning("[SDXL] No matching keys in LoRA checkpoint.")
-            return model, clip
-
-        p_in, p_mid, p_out, p_clip, p_other = _split_sdxl_patches_by_block(all_patches, inv_key_map, self.logger)
-
-        # --- Log counts and zero reasons ---
-        _log_sdxl_counts(self.logger, p_in, p_mid, p_out, p_clip, p_other,
-                         te_strength, in_strength, mid_strength, out_strength,
-                         inv_key_map)
-
-        # --- Apply ---
-        out_model = model.clone()
-        out_clip = clip.clone()
-
-        if p_in and in_strength != 0.0:
-            out_model.add_patches(p_in, in_strength)
-        if p_mid and mid_strength != 0.0:
-            out_model.add_patches(p_mid, mid_strength)
-        if p_out and out_strength != 0.0:
-            out_model.add_patches(p_out, out_strength)
-        if p_clip and te_strength != 0.0:
-            out_clip.add_patches(p_clip, te_strength)
-
-        return (out_model, out_clip)
+    def _classifier(self, model):
+        return classify_sdxl_key
 
 
 # -----------------------------------------------------------------------------#
