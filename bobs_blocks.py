@@ -340,6 +340,7 @@ _FLUX_TOKEN_MAP: Sequence[Tuple[str, str]] = (
     ("_context_embedder", FLUX_TEXT_CONDITIONING),   # diffusers name for txt_in
     ("_img_in", FLUX_IMAGE_HINT),
     ("_x_embedder", FLUX_IMAGE_HINT),                # diffusers name for img_in
+    ("_pos_embed_input", FLUX_IMAGE_HINT),           # FLUX ControlNet hint input
     ("_final_layer", FLUX_FINAL),
     ("_proj_out", FLUX_FINAL),                       # diffusers name for final_layer
     ("_norm_out", FLUX_FINAL),

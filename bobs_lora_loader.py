@@ -37,6 +37,12 @@ from .bobs_blocks import (
     flux_block_ranges,
     resolve_block_strengths,
 )
+from .bobs_universal import (  # registers the UNIVERSAL family on import
+    ALL_UNIVERSAL_BLOCKS,
+    UNIVERSAL_TOOLTIPS,
+    classify_universal_key,
+    discover_layout,
+)
 
 try:  # Added to ComfyUI in 2025; handles BFL-control / Wan-Fun / USO LoRAs.
     import comfy.lora_convert as _lora_convert
@@ -84,6 +90,14 @@ def _build_key_maps(model, clip) -> Tuple[Dict[str, Any], set]:
     return key_map, unet_targets
 
 
+def _architecture_name(model) -> str:
+    """Best-effort name of the loaded backbone, for the report."""
+    try:
+        return type(model.model).__name__
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _flux_geometry(model) -> Tuple[int, int]:
     """Read the double/single stream depths off the loaded FLUX model."""
     try:
@@ -101,9 +115,12 @@ def _format_report(tag: str,
                    blocks: List[str],
                    grouped: Dict[str, Dict[Any, Any]],
                    strengths: Dict[str, float],
-                   applied: Dict[str, int]) -> str:
-    lines = [f"[{tag}] {lora_name}  (preset: {preset})",
-             f"{'block':<40} {'weight':>7} {'found':>7} {'applied':>8}"]
+                   applied: Dict[str, int],
+                   detail: str = "") -> str:
+    lines = [f"[{tag}] {lora_name}  (preset: {preset})"]
+    if detail:
+        lines.append(detail)
+    lines.append(f"{'block':<40} {'weight':>7} {'found':>7} {'applied':>8}")
     for name in blocks:
         lines.append(
             f"{name:<40} {strengths.get(name, 0.0):>7.2f} "
@@ -209,8 +226,8 @@ class _BobsLoraLoaderBase:
 
     # ------------------------------------------------------------ classifier --
 
-    def _classifier(self, model):
-        """Return ``fn(model_state_dict_key) -> block name`` for this family."""
+    def _classifier(self, model, unet_targets):
+        """Return ``(fn(model_key) -> block name, detail_line)`` for this family."""
         raise NotImplementedError
 
     # ----------------------------------------------------------------- apply --
@@ -253,7 +270,7 @@ class _BobsLoraLoaderBase:
 
         # Group UNet patches per conceptual block; CLIP patches all share the
         # text-encoder block.
-        classify = self._classifier(model)
+        classify, detail = self._classifier(model, unet_targets)
         text_encoder_block = TEXT_ENCODER_BLOCK[self.FAMILY]
         grouped: Dict[str, Dict[Any, Any]] = {name: {} for name in self.BLOCKS}
 
@@ -278,7 +295,7 @@ class _BobsLoraLoaderBase:
         # Any tensor in the file that ComfyUI could not place is reported by
         # comfy.lora.load_lora itself as a "lora key not loaded" warning.
         report = _format_report(tag, lora_name, preset, self.BLOCKS,
-                                grouped, strengths, applied)
+                                grouped, strengths, applied, detail)
         self.logger.info("\n%s", report)
         _explain_empty_blocks(tag, self.BLOCKS, grouped, strengths)
 
@@ -303,9 +320,12 @@ class BobsLoraLoaderFlux(_BobsLoraLoaderBase):
     def INPUT_TYPES(cls):
         return cls._input_types()
 
-    def _classifier(self, model):
-        ranges = flux_block_ranges(*_flux_geometry(model))
-        return lambda key: classify_flux_key(key, ranges)
+    def _classifier(self, model, unet_targets):
+        depth, depth_single = _flux_geometry(model)
+        ranges = flux_block_ranges(depth, depth_single)
+        detail = (f"architecture: {_architecture_name(model)}  "
+                  f"double_blocks[{depth}] -> single_blocks[{depth_single}]")
+        return (lambda key: classify_flux_key(key, ranges)), detail
 
 
 # -----------------------------------------------------------------------------#
@@ -324,8 +344,41 @@ class BobsLoraLoaderSdxl(_BobsLoraLoaderBase):
     def INPUT_TYPES(cls):
         return cls._input_types()
 
-    def _classifier(self, model):
-        return classify_sdxl_key
+    def _classifier(self, model, unet_targets):
+        return classify_sdxl_key, f"architecture: {_architecture_name(model)}"
+
+
+# -----------------------------------------------------------------------------#
+#                            UNIVERSAL  LOADER                                 #
+# -----------------------------------------------------------------------------#
+
+class BobsLoraLoaderUniversal(_BobsLoraLoaderBase):
+    FAMILY = "UNIVERSAL"
+    BLOCKS = ALL_UNIVERSAL_BLOCKS
+    DESCRIPTION = (
+        "Block-weighted LoRA loading for any architecture ComfyUI supports — "
+        "SD1.5, SD2, SDXL, SD3/3.5, FLUX, Chroma, AuraFlow, PixArt, HiDream, "
+        "Qwen-Image, Wan, LTX-Video, Mochi, HunyuanVideo/DiT, Lumina, Cosmos and "
+        "others. The block stacks are discovered from the loaded model itself "
+        "rather than a hard-coded table, so new and pruned architectures work "
+        "without an update. Weights are assigned by depth: Early through Late "
+        "across the whole block stack, plus embeddings, output head and text "
+        "encoder."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return cls._input_types()
+
+    def _classifier(self, model, unet_targets):
+        layout = discover_layout(unet_targets)
+        detail = f"architecture: {_architecture_name(model)}  {layout.describe()}"
+        if not layout:
+            self.logger.warning(
+                "[UNIVERSAL] No block stacks recognised in this model; only the "
+                "embedding, output-head and text-encoder weights can be targeted."
+            )
+        return (lambda key: classify_universal_key(key, layout)), detail
 
 
 # -----------------------------------------------------------------------------#
@@ -335,9 +388,11 @@ class BobsLoraLoaderSdxl(_BobsLoraLoaderBase):
 NODE_CLASS_MAPPINGS = {
     "BobsLoraLoaderFlux": BobsLoraLoaderFlux,
     "BobsLoraLoaderSdxl": BobsLoraLoaderSdxl,
+    "BobsLoraLoaderUniversal": BobsLoraLoaderUniversal,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BobsLoraLoaderFlux": "Bobs LoRA Loader (FLUX)",
     "BobsLoraLoaderSdxl": "Bobs LoRA Loader (SDXL)",
+    "BobsLoraLoaderUniversal": "Bobs LoRA Loader (Universal)",
 }
