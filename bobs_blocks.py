@@ -98,6 +98,11 @@ BLOCK_TOOLTIPS: Dict[str, str] = {
 }
 BLOCK_TOOLTIPS[SDXL_TEXT_ENCODER] = BLOCK_TOOLTIPS[FLUX_TEXT_ENCODER]
 
+#: Per-family tooltip overrides, keyed family -> block -> text. Families share
+#: some block *names* ("Text Encoder", "Other Tensors") but want different help
+#: text, so a single flat dict cannot hold both.
+FAMILY_TOOLTIPS: Dict[str, Dict[str, str]] = {}
+
 # -----------------------------------------------------------------------------#
 #                             PRESET  DEFINITIONS                              #
 # -----------------------------------------------------------------------------#
@@ -278,6 +283,35 @@ LORA_BLOCK_PRESETS: Dict[str, Dict[str, Dict]] = {
 
 ALL_BLOCKS = {"FLUX": ALL_FLUX_BLOCKS, "SDXL": ALL_SDXL_BLOCKS}
 
+#: Families defined in this module. Additional families register themselves via
+#: :func:`register_family`; keep this constant for code that needs the built-in
+#: two regardless of what else has been imported.
+BUILTIN_FAMILIES = ("FLUX", "SDXL")
+
+
+def register_family(family: str,
+                    blocks: List[str],
+                    presets: Dict[str, Dict],
+                    text_encoder_block: str,
+                    tooltips: Dict[str, str] = None) -> None:
+    """Register an additional block family (see :mod:`bobs_universal`).
+
+    Kept explicit rather than done by assignment at import time: the tables
+    below are module state, and a silent import-order dependency makes both
+    behaviour and tests fragile. Tooltips are stored per family so that two
+    families sharing a block name (both call one "Text Encoder") do not
+    overwrite each other's help text.
+    """
+    ALL_BLOCKS[family] = blocks
+    LORA_BLOCK_PRESETS[family] = presets
+    TEXT_ENCODER_BLOCK[family] = text_encoder_block
+    FAMILY_TOOLTIPS[family] = dict(tooltips or {})
+
+
+def tooltip_for(family: str, block: str) -> str:
+    """Help text for a block, preferring the family's own wording."""
+    return FAMILY_TOOLTIPS.get(family, {}).get(block) or BLOCK_TOOLTIPS.get(block, block)
+
 # -----------------------------------------------------------------------------#
 #                              KEY NORMALISATION                               #
 # -----------------------------------------------------------------------------#
@@ -322,10 +356,27 @@ _SINGLE_SPLITS: Sequence[Tuple[float, str]] = (
     (1.0, FLUX_LATE_UP),
 )
 
-# ``single`` must be tested before ``double``: "single_transformer_blocks_3"
-# would otherwise also satisfy the double-stream pattern.
-_RE_SINGLE_BLOCK = re.compile(r"_(?:single_blocks|single_transformer_blocks)_(\d+)(?:_|$)")
-_RE_DOUBLE_BLOCK = re.compile(r"_(?:double_blocks|transformer_blocks)_(\d+)(?:_|$)")
+# Stack matching runs on the RAW dotted key, never the underscore-normalised
+# one. Normalising erases the separator that distinguishes an *outermost* stack
+# from one nested inside a block: an SDXL key
+# "input_blocks.4.1.transformer_blocks.0.attn1.to_q.weight" normalises to
+# "..._input_blocks_4_1_transformer_blocks_0_..." where a naive search matches
+# the inner transformer_blocks and reads the key as double-stream block 0.
+# Anchoring on "." keeps the two apart, and makes the leftmost match the
+# outermost stack.
+#
+# ``single`` is still tested before ``double`` so that
+# "single_transformer_blocks.3" cannot be read as "transformer_blocks.3".
+#
+# Anchoring on "." alone is not enough — the nested transformer_blocks is also
+# dot-preceded. FLUX's stacks are always *top level*, so the pattern is anchored
+# to the start of the module path (after an optional known prefix). SDXL's
+# nested stack then cannot match, because "input_blocks" sits in front of it.
+_PREFIX = r"^(?:model\.)?(?:diffusion_model\.|transformer\.)?"
+_RE_SINGLE_BLOCK = re.compile(
+    _PREFIX + r"(?:single_blocks|single_transformer_blocks)\.(-?\d+)(?=\.|$)")
+_RE_DOUBLE_BLOCK = re.compile(
+    _PREFIX + r"(?:double_blocks|transformer_blocks)\.(-?\d+)(?=\.|$)")
 
 # Head / tail tokens, most specific first.
 _FLUX_TOKEN_MAP: Sequence[Tuple[str, str]] = (
@@ -375,19 +426,31 @@ def _bucket(index: int, boundaries: Sequence[Tuple[int, str]], fallback: str) ->
     return fallback
 
 
+def _resolve_index(index: int, boundaries: Sequence[Tuple[int, str]]) -> int:
+    """Resolve a Python-style negative block index against the stack size."""
+    if index >= 0:
+        return index
+    size = boundaries[-1][0] if boundaries else 0
+    return max(index + size, 0)
+
+
 def classify_flux_key(model_key: str, ranges=None) -> str:
     """Map a FLUX UNet state-dict key to one of :data:`ALL_FLUX_BLOCKS`."""
     double_bounds, single_bounds = ranges or flux_block_ranges()
+
+    # Block stacks match on the raw dotted key (see _RE_SINGLE_BLOCK); the
+    # token checks below match on the normalised one.
+    match = _RE_SINGLE_BLOCK.search(model_key)
+    if match:
+        return _bucket(_resolve_index(int(match.group(1)), single_bounds),
+                       single_bounds, FLUX_LATE_UP)
+
+    match = _RE_DOUBLE_BLOCK.search(model_key)
+    if match:
+        return _bucket(_resolve_index(int(match.group(1)), double_bounds),
+                       double_bounds, FLUX_CORE)
+
     nk = normalize_key(model_key)
-
-    match = _RE_SINGLE_BLOCK.search(nk)
-    if match:
-        return _bucket(int(match.group(1)), single_bounds, FLUX_LATE_UP)
-
-    match = _RE_DOUBLE_BLOCK.search(nk)
-    if match:
-        return _bucket(int(match.group(1)), double_bounds, FLUX_CORE)
-
     for token, block in _FLUX_TOKEN_MAP:
         if token in nk:
             return block
@@ -399,15 +462,23 @@ def classify_flux_key(model_key: str, ranges=None) -> str:
 #                             SDXL  CLASSIFICATION                             #
 # -----------------------------------------------------------------------------#
 
+# Anchored on "." for the same reason as the FLUX patterns above: the stage is
+# the outermost path component, not whatever is nested inside a block.
+_RE_SDXL_STAGE = re.compile(
+    _PREFIX + r"(input_blocks|middle_block|output_blocks)(?=\.|$)")
+
+_SDXL_STAGE_BLOCKS = {
+    "input_blocks": SDXL_INPUT_BLOCKS,
+    "middle_block": SDXL_MIDDLE_BLOCK,
+    "output_blocks": SDXL_OUTPUT_BLOCKS,
+}
+
+
 def classify_sdxl_key(model_key: str) -> str:
     """Map an SDXL UNet state-dict key to one of :data:`ALL_SDXL_BLOCKS`."""
-    nk = normalize_key(model_key)
-    if "_input_blocks_" in nk:
-        return SDXL_INPUT_BLOCKS
-    if "_middle_block_" in nk:
-        return SDXL_MIDDLE_BLOCK
-    if "_output_blocks_" in nk:
-        return SDXL_OUTPUT_BLOCKS
+    match = _RE_SDXL_STAGE.search(model_key)
+    if match:
+        return _SDXL_STAGE_BLOCKS[match.group(1)]
     return SDXL_OTHER
 
 

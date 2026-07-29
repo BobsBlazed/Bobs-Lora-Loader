@@ -27,19 +27,21 @@ import folder_paths
 from .bobs_blocks import (
     ALL_FLUX_BLOCKS,
     ALL_SDXL_BLOCKS,
-    BLOCK_TOOLTIPS,
     FLUX_DEFAULT_DEPTH,
     FLUX_DEFAULT_DEPTH_SINGLE,
+    FLUX_OTHER,
     LORA_BLOCK_PRESETS,
+    SDXL_OTHER,
     TEXT_ENCODER_BLOCK,
     classify_flux_key,
     classify_sdxl_key,
     flux_block_ranges,
     resolve_block_strengths,
+    tooltip_for,
 )
 from .bobs_universal import (  # registers the UNIVERSAL family on import
     ALL_UNIVERSAL_BLOCKS,
-    UNIVERSAL_TOOLTIPS,
+    UNIVERSAL_OTHER,
     classify_universal_key,
     discover_layout,
 )
@@ -53,6 +55,11 @@ logger = logging.getLogger("BobsLoraLoader")
 
 MAX_STRENGTH = 5.0
 MAX_BLOCK_WEIGHT = 2.0
+
+#: Share of UNet tensors in a single block above which the family looks wrong.
+#: A correctly-paired LoRA spreads across blocks; the worst real case measured
+#: was 60/200 (30%) in one block, so 0.9 leaves a wide margin.
+_MISMATCH_SHARE = 0.9
 
 
 # -----------------------------------------------------------------------------#
@@ -132,6 +139,51 @@ def _format_report(tag: str,
     return "\n".join(lines)
 
 
+def _mismatch_warning(tag: str,
+                      blocks: List[str],
+                      grouped: Dict[str, Dict[Any, Any]],
+                      text_encoder_block: str,
+                      catch_all_block: str) -> Optional[str]:
+    """Detect a LoRA/model pairing that the family classifier cannot resolve.
+
+    Picking the wrong loader for a model is silent otherwise: the keys still
+    match (ComfyUI's key map is built from the model, so the LoRA loads), they
+    just all land in whichever single bucket the classifier happens to reach.
+    Two shapes of that are worth calling out:
+
+    - everything piled into the family's catch-all, which then applies at that
+      slider's weight with no block weighting at all;
+    - everything piled into one *named* block, which means the sliders are
+      lying about what they control.
+    """
+    unet_counts = {name: len(patches) for name, patches in grouped.items()
+                   if name != text_encoder_block and patches}
+    total = sum(unet_counts.values())
+    if total < 8:  # too few patches for the distribution to mean anything
+        return None
+
+    # A threshold rather than "all of them": cross-family key names overlap just
+    # enough to scatter a few tensors. Feeding a real SDXL key set through the
+    # FLUX classifier leaves 98.7% in the catch-all and sends the rest to
+    # "Final Output Layer" via the shared proj_out token, which an exact-equality
+    # test would wave through.
+    def _share(name: str) -> float:
+        return unet_counts.get(name, 0) / total
+
+    if _share(catch_all_block) >= _MISMATCH_SHARE:
+        return (f"WARNING: {_share(catch_all_block):.0%} of UNet tensors landed in "
+                f"'{catch_all_block}'. This LoRA does not look like a {tag} LoRA, or the "
+                f"model is not a {tag} model — the per-block sliders are barely doing "
+                f"anything. Try the Universal loader.")
+
+    dominant, count = max(unet_counts.items(), key=lambda kv: kv[1])
+    if count / total >= _MISMATCH_SHARE and len(blocks) > 2:
+        return (f"WARNING: {count / total:.0%} of UNet tensors landed in '{dominant}'. "
+                f"That usually means this model is not a {tag} model, so the block "
+                f"sliders do not map to what their names say. Try the Universal loader.")
+    return None
+
+
 def _explain_empty_blocks(tag: str,
                           blocks: List[str],
                           grouped: Dict[str, Dict[Any, Any]],
@@ -155,6 +207,8 @@ class _BobsLoraLoaderBase:
 
     FAMILY = "FLUX"
     BLOCKS: List[str] = ALL_FLUX_BLOCKS
+    #: Bucket that receives anything the family classifier could not place.
+    CATCH_ALL_BLOCK = FLUX_OTHER
 
     RETURN_TYPES = ("MODEL", "CLIP", "STRING")
     RETURN_NAMES = ("MODEL", "CLIP", "info")
@@ -193,7 +247,7 @@ class _BobsLoraLoaderBase:
         for block in cls.BLOCKS:
             required[block] = ("FLOAT", {
                 "default": 1.0, "min": -MAX_BLOCK_WEIGHT, "max": MAX_BLOCK_WEIGHT, "step": 0.05,
-                "tooltip": BLOCK_TOOLTIPS.get(block, block),
+                "tooltip": tooltip_for(cls.FAMILY, block),
             })
         return {
             "required": required,
@@ -253,6 +307,9 @@ class _BobsLoraLoaderBase:
             self.logger.error(message)
             return (model, clip, message)
 
+        if preset not in LORA_BLOCK_PRESETS[self.FAMILY]:
+            self.logger.warning(
+                "[%s] unknown preset %r; falling back to the slider values.", tag, preset)
         strengths = resolve_block_strengths(self.FAMILY, preset, strength, kwargs)
 
         key_map, unet_targets = _build_key_maps(model, clip)
@@ -296,6 +353,13 @@ class _BobsLoraLoaderBase:
         # comfy.lora.load_lora itself as a "lora key not loaded" warning.
         report = _format_report(tag, lora_name, preset, self.BLOCKS,
                                 grouped, strengths, applied, detail)
+
+        mismatch = _mismatch_warning(tag, self.BLOCKS, grouped,
+                                     text_encoder_block, self.CATCH_ALL_BLOCK)
+        if mismatch:
+            self.logger.warning("[%s] %s", tag, mismatch)
+            report = f"{report}\n{mismatch}"
+
         self.logger.info("\n%s", report)
         _explain_empty_blocks(tag, self.BLOCKS, grouped, strengths)
 
@@ -335,6 +399,7 @@ class BobsLoraLoaderFlux(_BobsLoraLoaderBase):
 class BobsLoraLoaderSdxl(_BobsLoraLoaderBase):
     FAMILY = "SDXL"
     BLOCKS = ALL_SDXL_BLOCKS
+    CATCH_ALL_BLOCK = SDXL_OTHER
     DESCRIPTION = (
         "Applies a LoRA to an SDXL model with independent weights for the text "
         "encoder and the UNet input / middle / output stages."
@@ -355,6 +420,7 @@ class BobsLoraLoaderSdxl(_BobsLoraLoaderBase):
 class BobsLoraLoaderUniversal(_BobsLoraLoaderBase):
     FAMILY = "UNIVERSAL"
     BLOCKS = ALL_UNIVERSAL_BLOCKS
+    CATCH_ALL_BLOCK = UNIVERSAL_OTHER
     DESCRIPTION = (
         "Block-weighted LoRA loading for any architecture ComfyUI supports — "
         "SD1.5, SD2, SDXL, SD3/3.5, FLUX, Chroma, AuraFlow, PixArt, HiDream, "
