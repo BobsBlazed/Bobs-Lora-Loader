@@ -289,6 +289,37 @@ class TestRealWorldRegressions(unittest.TestCase):
             self.assertEqual(bu.classify_universal_key(key, layout),
                              bu.UNIVERSAL_INPUT, key)
 
+    def test_head_token_does_not_swallow_attention_names(self):
+        """A bare "_head_" substring also matched multi_head_attention."""
+        layout = bu.discover_layout(_flat_stack("blocks", 28))
+        self.assertEqual(bu.classify_universal_key(
+            "diffusion_model.head.head.weight", layout), bu.UNIVERSAL_OUTPUT)
+        self.assertEqual(bu.classify_universal_key(
+            "diffusion_model.out.2.weight", layout), bu.UNIVERSAL_OUTPUT)
+        for key in ("diffusion_model.multi_head_attention.weight",
+                    "diffusion_model.some.head_dim_proj.weight"):
+            self.assertNotEqual(bu.classify_universal_key(key, layout),
+                                bu.UNIVERSAL_OUTPUT, key)
+
+    def test_every_depth_bucket_populated_at_real_depths(self):
+        order = (bu.UNIVERSAL_EARLY, bu.UNIVERSAL_EARLY_MID, bu.UNIVERSAL_MID,
+                 bu.UNIVERSAL_LATE_MID, bu.UNIVERSAL_LATE)
+        for depth in (12, 19, 24, 28, 40, 57, 60):
+            keys = _flat_stack("blocks", depth)
+            layout = bu.discover_layout(keys)
+            counts = [sum(1 for k in keys
+                          if bu.classify_universal_key(k, layout) == b) for b in order]
+            self.assertEqual(sum(counts), depth, depth)
+            self.assertTrue(all(c > 0 for c in counts), f"depth={depth}: {counts}")
+
+    def test_last_block_reaches_the_final_bucket(self):
+        """The top bucket boundary must include the deepest block."""
+        for depth in (3, 5, 19, 60):
+            keys = _flat_stack("blocks", depth)
+            layout = bu.discover_layout(keys)
+            self.assertEqual(bu.classify_universal_key(keys[-1], layout),
+                             bu.UNIVERSAL_LATE, depth)
+
     def test_flux_controlnet_hint_input(self):
         self.assertEqual(
             bobs_blocks.classify_flux_key("diffusion_model.pos_embed_input.weight"),
@@ -317,7 +348,22 @@ class TestUniversalPresets(unittest.TestCase):
 
     def test_every_block_has_a_tooltip(self):
         for name in bu.ALL_UNIVERSAL_BLOCKS:
-            self.assertIn(name, bobs_blocks.BLOCK_TOOLTIPS)
+            text = bobs_blocks.tooltip_for(bu.UNIVERSAL_FAMILY, name)
+            self.assertTrue(text and text != name, name)
+
+    def test_shared_block_names_keep_per_family_tooltips(self):
+        """FLUX/SDXL and UNIVERSAL both call a block "Text Encoder"."""
+        shared = bu.UNIVERSAL_TEXT_ENCODER
+        universal = bobs_blocks.tooltip_for(bu.UNIVERSAL_FAMILY, shared)
+        flux = bobs_blocks.tooltip_for("FLUX", shared)
+        self.assertNotEqual(universal, flux)
+        self.assertIn("whatever the model uses", universal)
+        self.assertIn("trigger words", flux)
+
+    def test_registration_does_not_disturb_the_builtin_families(self):
+        for family in bobs_blocks.BUILTIN_FAMILIES:
+            self.assertIn(family, bobs_blocks.ALL_BLOCKS)
+            self.assertIn(family, bobs_blocks.LORA_BLOCK_PRESETS)
 
 
 if __name__ == "__main__":

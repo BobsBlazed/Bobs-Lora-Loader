@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bobs_blocks import (  # noqa: E402
+    ALL_BLOCKS,
     ALL_FLUX_BLOCKS,
     ALL_SDXL_BLOCKS,
     FLUX_CORE,
@@ -205,6 +206,48 @@ class TestSdxlClassification(unittest.TestCase):
         self.assertEqual(classify_sdxl_key(key), SDXL_OUTPUT_BLOCKS)
 
 
+class TestNestedStackIsolation(unittest.TestCase):
+    """The dedicated classifiers must not read a *nested* block stack.
+
+    SDXL nests transformer_blocks inside input_blocks/middle_block/
+    output_blocks. Matching on the underscore-normalised key made the FLUX
+    classifier see that inner stack and file SDXL keys as double-stream blocks.
+    """
+
+    SDXL_KEYS = [
+        "diffusion_model.input_blocks.4.1.transformer_blocks.0.attn1.to_q.weight",
+        "diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_k.weight",
+        "diffusion_model.output_blocks.5.1.transformer_blocks.1.ff.net.0.proj.weight",
+    ]
+
+    def test_flux_classifier_does_not_claim_sdxl_keys(self):
+        for key in self.SDXL_KEYS:
+            self.assertEqual(classify_flux_key(key), FLUX_OTHER, key)
+
+    def test_sdxl_classifier_still_reads_the_outer_stage(self):
+        expected = [SDXL_INPUT_BLOCKS, SDXL_MIDDLE_BLOCK, SDXL_OUTPUT_BLOCKS]
+        for key, want in zip(self.SDXL_KEYS, expected):
+            self.assertEqual(classify_sdxl_key(key), want, key)
+
+    def test_flux_keys_are_unaffected(self):
+        self.assertEqual(
+            classify_flux_key("diffusion_model.double_blocks.0.img_attn.qkv.weight"),
+            FLUX_EARLY_DOWN)
+        self.assertEqual(
+            classify_flux_key("diffusion_model.single_blocks.37.linear1.weight"),
+            FLUX_LATE_UP)
+        # diffusers spellings still resolve
+        self.assertEqual(classify_flux_key("transformer_blocks.3.attn.to_q.weight"),
+                         FLUX_EARLY_DOWN)
+        self.assertEqual(classify_flux_key("single_transformer_blocks.3.attn.to_q.weight"),
+                         FLUX_CORE)
+
+    def test_flux_negative_index_resolves_against_the_stack(self):
+        self.assertEqual(
+            classify_flux_key("diffusion_model.double_blocks.-1.img_attn.qkv.weight"),
+            FLUX_CORE)
+
+
 class TestStrengthResolution(unittest.TestCase):
     def test_custom_preset_uses_sliders_scaled_by_global_strength(self):
         overrides = {name: 0.5 for name in ALL_SDXL_BLOCKS}
@@ -242,8 +285,11 @@ class TestStrengthResolution(unittest.TestCase):
 
 class TestPresetIntegrity(unittest.TestCase):
     def test_every_preset_covers_every_block(self):
+        # Drive off ALL_BLOCKS rather than a literal family map: other modules
+        # register additional families, and this test must not care whether
+        # they happen to have been imported first.
         for family, presets in LORA_BLOCK_PRESETS.items():
-            blocks = {"FLUX": ALL_FLUX_BLOCKS, "SDXL": ALL_SDXL_BLOCKS}[family]
+            blocks = ALL_BLOCKS[family]
             for preset_name, config in presets.items():
                 if preset_name == "Custom":
                     self.assertEqual(config, {})

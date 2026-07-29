@@ -1,7 +1,7 @@
 [project]
 name = "Bobs_LoRA_Loader"
 description = "Block-weighted LoRA loaders for ComfyUI. Dedicated SDXL and FLUX nodes plus a Universal node that discovers any supported architecture's block layout at runtime (SD1.5/2/3, Chroma, AuraFlow, PixArt, HiDream, Qwen-Image, Wan, LTX-Video, Mochi, HunyuanVideo, Lumina, Cosmos and more). Presets for common use-cases like 'Character' and 'Style', plus a 'Custom' mode for per-block control."
-version = "1.2.0"
+version = "1.2.1"
 license = {file = "LICENSE"}
 
 [project.urls]

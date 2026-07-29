@@ -32,13 +32,7 @@ Imports nothing from ComfyUI or torch; see ``tests/test_bobs_universal.py``.
 import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .bobs_blocks import (
-    ALL_BLOCKS,
-    BLOCK_TOOLTIPS,
-    LORA_BLOCK_PRESETS,
-    TEXT_ENCODER_BLOCK,
-    normalize_key,
-)
+from .bobs_blocks import normalize_key, register_family
 
 # -----------------------------------------------------------------------------#
 #                                 BLOCK NAMES                                  #
@@ -74,7 +68,7 @@ _DEPTH_BUCKETS: Sequence[Tuple[float, str]] = (
     (0.4, UNIVERSAL_EARLY_MID),
     (0.6, UNIVERSAL_MID),
     (0.8, UNIVERSAL_LATE_MID),
-    (1.01, UNIVERSAL_LATE),
+    (1.0, UNIVERSAL_LATE),
 )
 
 UNIVERSAL_TOOLTIPS: Dict[str, str] = {
@@ -154,9 +148,12 @@ _OUTPUT_TOKENS: Tuple[str, ...] = (
     "_norm_out",
     "_unpatchify",
     "_final_norm",
-    "_head_",
 )
-_OUTPUT_RE = re.compile(r"_out_\d+(?=_|$)")  # SD "out.0" / "out.2" head
+# Anchored patterns rather than loose substrings. A bare "_head_" token also
+# matched "multi_head_attention" and "head_dim_proj"; these require the segment
+# to actually be a head module ("head.head.weight", "out.0", "out.2").
+_OUTPUT_RE = re.compile(
+    r"(?:^|\.)(?:out\.\d+|head(?:\.head)?)(?=\.|$)", re.IGNORECASE)
 
 _INPUT_TOKENS: Tuple[str, ...] = (
     "_img_in",
@@ -301,7 +298,7 @@ def classify_universal_key(model_key: str, layout: BlockLayout) -> str:
     for token in _OUTPUT_TOKENS:
         if token in nk:
             return UNIVERSAL_OUTPUT
-    if _OUTPUT_RE.search(nk):
+    if _OUTPUT_RE.search(model_key):  # dot-anchored: raw key, not normalised
         return UNIVERSAL_OUTPUT
 
     for token in _INPUT_TOKENS:
@@ -396,7 +393,12 @@ UNIVERSAL_PRESETS = {
     },
 }
 
-LORA_BLOCK_PRESETS["UNIVERSAL"] = UNIVERSAL_PRESETS
-ALL_BLOCKS["UNIVERSAL"] = ALL_UNIVERSAL_BLOCKS
-TEXT_ENCODER_BLOCK["UNIVERSAL"] = UNIVERSAL_TEXT_ENCODER
-BLOCK_TOOLTIPS.update(UNIVERSAL_TOOLTIPS)
+UNIVERSAL_FAMILY = "UNIVERSAL"
+
+register_family(
+    UNIVERSAL_FAMILY,
+    blocks=ALL_UNIVERSAL_BLOCKS,
+    presets=UNIVERSAL_PRESETS,
+    text_encoder_block=UNIVERSAL_TEXT_ENCODER,
+    tooltips=UNIVERSAL_TOOLTIPS,
+)

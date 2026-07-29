@@ -160,6 +160,36 @@ python -m unittest discover -s tests -v
 
 ## Changelog
 
+### 1.2.1
+
+Code-review fixes. No behaviour change for a correctly-paired LoRA and model.
+
+-   **The FLUX and SDXL classifiers now anchor on the module path**, matching
+    the Universal loader. They previously matched on an underscore-normalised
+    key, which erases the separator that tells an *outermost* block stack from
+    one nested inside a block. An SDXL key such as
+    `input_blocks.4.1.transformer_blocks.0.attn1.to_q.weight` was read as
+    double-stream block 0, so pointing the FLUX node at an SDXL model filed
+    every tensor under "Early Downsampling". Real FLUX and SDXL keys are
+    unaffected — this only ever misfired across families.
+-   **Mismatched loader and model now warn** instead of failing silently. If
+    90% or more of a LoRA's UNet tensors land in one block, the `info` output
+    and the log say so and point at the Universal loader. Measured: a real SDXL
+    key set through the FLUX node warns at 99%, a FLUX key set through the SDXL
+    node at 100%, while all six correctly-paired combinations stay silent.
+-   **Families register explicitly** via `register_family()` rather than by
+    mutating `bobs_blocks`'s tables at import time, removing an import-order
+    dependency that also made the test suite fragile.
+-   **Tooltips are per family.** FLUX/SDXL and Universal each define a block
+    called "Text Encoder"; the Universal wording used to overwrite the other.
+-   **`Output Head` detection tightened.** The `_head_` substring also matched
+    `multi_head_attention` and `head_dim_proj`; it is now anchored to a real
+    head module.
+-   An unknown `preset` name (only reachable from hand-edited workflow JSON)
+    logs a warning instead of silently behaving as `Custom`.
+-   Test suite grown to 71, including a new `tests/test_node_behaviour.py`
+    covering node registration, widget order, the report and the new warning.
+
 ### 1.2.0
 
 **New: a Universal loader covering every architecture ComfyUI supports.**
