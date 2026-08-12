@@ -4,22 +4,41 @@
 |---|---|
 |![image](https://github.com/user-attachments/assets/f614b579-c232-4f33-b994-f196c225edcf)|![image](https://github.com/user-attachments/assets/fca84c9b-211e-41fc-86a9-583e187cd6f1)|
 
-An advanced LoRA loader for ComfyUI that provides granular, block-level control over how a LoRA is applied to both **SDXL** and **FLUX** models, giving you unparalleled control over your image generation process.
+Block-weighted LoRA loading for ComfyUI. Instead of one strength slider for the
+whole model, you get a slider per conceptual part of it — text encoder,
+composition, subject, style, detail, texture — so you can keep the parts of a
+LoRA you want and turn down the parts you don't.
 
-This node allows you to go beyond a single strength slider and specify different weights for distinct parts of the model, such as the text encoder, the U-Net input blocks, and the output blocks. This is particularly useful for mixing and matching LoRA concepts, strengthening character details while reducing stylistic influence, or vice-versa.
+Three nodes, all under the `Bobs_Nodes` category:
+
+| Node | Use it for |
+|---|---|
+| **Bobs LoRA Loader (FLUX)** | FLUX.1 dev/schnell, Chroma and other FLUX variants, with FLUX's named blocks |
+| **Bobs LoRA Loader (SDXL)** | SDXL and SD1.5/SD2, with the UNet's input/middle/output stages |
+| **Bobs LoRA Loader (Universal)** | Everything else, and anything new — see [supported architectures](#universal) |
 
 ## Features
 
--   **Any Architecture**: A third **Universal** loader covers everything else ComfyUI supports — SD1.5, SD2, SD3/3.5, Chroma, AuraFlow, PixArt, HiDream, Qwen-Image, Wan, LTX-Video, Mochi, HunyuanVideo/DiT, Lumina, Cosmos and more. It discovers the model's block layout at runtime instead of using a hard-coded table, so new and pruned architectures work without an update.
--   **Dual Model Support**: Separate, optimized loaders for `SDXL` and `FLUX` models, each tailored to the architecture's specific blocks.
--   **Granular Block-Level Control**: Fine-tune the strength of a LoRA on different conceptual parts of the diffusion model.
--   **Intelligent Presets**: Comes with pre-configured presets for common use cases like `Character`, `Style`, `Concept`, `Detail & Texture` and `Fix Hands/Anatomy`.
--   **Full Customization**: Set the `preset` to `Custom` to get direct slider control over every block for ultimate fine-tuning.
--   **Dialect-proof LoRA compatibility**: Classification runs on the *canonical model key* each patch targets, after ComfyUI has translated the LoRA's own naming scheme. Every format ComfyUI can load — kohya `lora_unet_*`, OneTrainer `lora_transformer_*`, diffusers `transformer.*`, LyCORIS, DiffSynth, PEFT — is bucketed correctly, including fused `qkv` / `linear1` patches.
--   **Geometry-aware FLUX blocks**: Block ranges are derived from the loaded model's own `depth` / `depth_single_blocks`, so FLUX.1 dev/schnell and pruned or distilled variants all map correctly instead of falling into "Other Tensors".
--   **Per-block report**: A third `info` output (and a matching console log) shows, per block, the weight used, how many tensors were found, and how many were actually patched.
--   **Optional CLIP**: leave the `clip` input unconnected to patch the model only.
--   **Standard LoRA Functionality**: To use it like a standard LoRA loader, simply select the `Full (Normal LoRA)` preset.
+-   **Works on any supported architecture.** The Universal loader discovers the
+    model's block layout at runtime rather than reading a hard-coded table, so
+    pruned, distilled and brand-new architectures work without an update.
+-   **Granular block-level control.** Tune a LoRA's strength separately on each
+    conceptual part of the diffusion model.
+-   **Presets** for common jobs: `Character`, `Style`, `Concept`,
+    `Detail & Texture`, `Fix Hands/Anatomy` — plus `Custom` for the sliders.
+-   **Dialect-proof compatibility.** Classification runs on the *canonical model
+    key* each patch targets, after ComfyUI has translated the LoRA's own naming
+    scheme. Every format ComfyUI can load — kohya `lora_unet_*`, OneTrainer
+    `lora_transformer_*`, diffusers `transformer.*`, LyCORIS, DiffSynth, PEFT —
+    is bucketed correctly, including fused `qkv` / `linear1` patches.
+-   **Per-block report.** An `info` output (and a matching console log) shows the
+    detected architecture and, per block, the weight used, how many tensors were
+    found and how many were actually patched.
+-   **Tells you when the pairing is wrong.** Point a node at the wrong model
+    family and it says so instead of silently doing nothing useful.
+-   **Optional CLIP.** Leave the `clip` input unconnected to patch the model only.
+-   **Drop-in standard behaviour.** Select `Full (Normal LoRA)` to get the same
+    result as ComfyUI's built-in `LoraLoader`.
 
 ## Installation
 
@@ -33,40 +52,61 @@ This node allows you to go beyond a single strength slider and specify different
     ```
 3.  Restart ComfyUI.
 
+Or install **Bobs_LoRA_Loader** from the ComfyUI Manager / Comfy Registry.
+
 ## How to Use
 
-1.  In ComfyUI, add the node by right-clicking, selecting "Add Node," and navigating to the `Bobs_Nodes` category.
-2.  Choose either **Bobs LoRA Loader (SDXL)** or **Bobs LoRA Loader (FLUX)** depending on your base model.
-3.  Connect your `MODEL` and `CLIP` outputs into the corresponding inputs on the node. `CLIP` is optional — leave it unconnected to patch the model only.
-4.  Select the LoRA you wish to apply from the `lora_name` dropdown.
-5.  Use the `preset` dropdown to quickly apply a set of block weights for a specific purpose (e.g. "Character" to focus on subject detail).
-6.  For maximum control, set the `preset` to `Custom` and adjust the individual block sliders.
-7.  The main `strength` slider acts as a global multiplier for all other block weights, allowing you to scale the entire effect up or down.
-8.  Hook the `info` output up to a preview-text node (or read the console) to see exactly which blocks the LoRA actually touched.
+1.  Right-click → **Add Node** → `Bobs_Nodes`, and pick the node matching your
+    base model (see the table above). When in doubt, use **Universal** — it
+    works on FLUX and SDXL too, just with depth-based block names instead of
+    architecture-specific ones.
+2.  Connect `MODEL` and `CLIP`. `CLIP` is optional — leave it unconnected to
+    patch the model only.
+3.  Pick the LoRA from `lora_name`.
+4.  Choose a `preset`, or set it to `Custom` and drive the sliders yourself.
+5.  `strength` is a global multiplier applied on top of every block weight.
+6.  Hook `info` up to a preview-text node (or read the console) to see exactly
+    which blocks the LoRA touched.
 
-> **Note on presets:** a preset other than `Custom` *overrides* the sliders — it does not blend with them. Only `strength` still applies on top.
+> **Presets override the sliders.** Anything other than `Custom` ignores the
+> slider values entirely — it does not blend with them. Only `strength` still
+> applies on top.
 
 ### Reading the `info` output
 
 ```
-[FLUX] mylora.safetensors  (preset: Character)
+[UNIVERSAL] mylora.safetensors  (preset: Style)
+architecture: QwenImage  transformer_blocks[60]  (total 60)
 block                                     weight   found  applied
-Text Conditioning                           1.00       1        1
-Early Downsampling (Composition)            0.60      16       16
-Mid Upsampling (Detail Generation)          0.00      48        0
-Text Encoder                                1.00       4        4
-TOTAL                                                200      133
+Text Encoder                                0.20       0        0
+Input & Embeddings                          1.00       9        9
+Early Blocks (Composition)                  0.10     384      384
+Early-Mid Blocks (Subject)                  0.00     384        0
+Mid Blocks (Concept & Style)                0.50     384      384
+Late-Mid Blocks (Detail)                    1.00     384      384
+Late Blocks (Texture)                       1.00     384      384
+Output Head                                 1.00       4        4
+Other Tensors                               1.00       0        0
+TOTAL                                               1933     1549
 ```
 
--   **found** — tensors in this LoRA that belong to that block.
--   **applied** — tensors actually patched. A block with `found > 0` and `applied 0` was skipped because its weight is `0.00`.
--   A block with `found 0` means the LoRA simply contains no weights for it; the console log spells this out.
+-   **architecture** — the backbone ComfyUI detected, and the block stacks found
+    in it. The FLUX and SDXL nodes report their architecture here too.
+-   **found** — tensors in this LoRA belonging to that block.
+-   **applied** — tensors actually patched. `found > 0` with `applied 0` means
+    the block's weight is `0.00`, which is usually what you asked for.
+-   `found 0` means the LoRA contains no weights for that block at all; the
+    console log spells this out per block.
+-   **Other Tensors** should normally be `0` or close to it. A large number here
+    means the classifier could not place those tensors — see
+    [Troubleshooting](#troubleshooting).
 
 ## Block Layout
 
 ### FLUX
 
-Ranges below are for the canonical FLUX.1 geometry (19 double-stream blocks, 38 single-stream blocks). Other depths are scaled proportionally.
+Ranges below are for the canonical FLUX.1 geometry (19 double-stream blocks, 38
+single-stream blocks). Other depths are scaled proportionally.
 
 | Block | Covers |
 |---|---|
@@ -87,6 +127,8 @@ Ranges below are for the canonical FLUX.1 geometry (19 double-stream blocks, 38 
 | Other Tensors | anything unmatched (normally empty) |
 
 ### SDXL
+
+Also works for SD1.5 and SD2 — same UNet shape, different depth.
 
 | Block | Covers |
 |---|---|
@@ -129,12 +171,15 @@ split into five buckets, so the same five sliders mean the same thing on a
 | Output Head | Final projection back to latent space |
 | Other Tensors | Anything unmatched (normally empty) |
 
-The `info` output names the detected architecture and the discovered stacks, e.g.
+Directly verified against SD1.5, SDXL, SD3, FLUX (full and pruned geometry),
+AuraFlow, PixArt, LTX-Video, Lumina, Qwen-Image and Wan — every state-dict key
+of each classified, none falling through to `Other Tensors`.
 
-```
-[UNIVERSAL] mylora.safetensors  (preset: Style)
-architecture: QwenImage  transformer_blocks[60]  (total 60)
-```
+Architectures such as HiDream, Chroma, Mochi, HunyuanVideo and Cosmos are
+supported by the same mechanism but were not part of that run, so treat them as
+expected-to-work rather than confirmed. Because the layout comes from the model
+rather than a table, an architecture missing from both lists will usually still
+work — the `info` output tells you whether the stacks were found.
 
 Use the dedicated FLUX or SDXL loader when you want that architecture's named
 blocks; use Universal for everything else, or when you want one node whose
@@ -142,109 +187,70 @@ sliders behave consistently across models.
 
 ## Why Use Block-Weighted LoRA?
 
-A single LoRA file often contains training for multiple concepts (e.g. a character's face, their clothing, and the overall artistic style). A standard LoRA loader applies the LoRA with one uniform strength across the entire model.
+A single LoRA file often contains training for multiple concepts — a character's
+face, their clothing, and the overall artistic style. A standard LoRA loader
+applies all of it at one uniform strength.
 
-This can be limiting. For example:
--   You might want a character's features but not the stiff, overbaked style it was trained with.
--   You might want a LoRA's artistic style but not the character concepts embedded within it.
+That can be limiting:
 
-By assigning different strengths to different model blocks, you can selectively emphasize or de-emphasize these aspects. The SDXL loader provides coarse control over the main UNet stages, while the FLUX loader offers even finer-grained control over conceptual phases like "Composition," "Refinement," and "Final Textures."
+-   You might want a character's features but not the stiff, overbaked style it
+    was trained with.
+-   You might want a LoRA's artistic style but not the character baked into it.
+-   Two LoRAs might fight each other when both are applied at full strength.
+
+Roughly, earlier blocks carry composition and subject identity while later
+blocks carry style, detail and texture — so a `Character` preset keeps the early
+blocks and drops the late ones, and `Style` does the reverse. The exact split is
+in the tables above.
+
+## Troubleshooting
+
+**The nodes don't appear in the menu.** Check the ComfyUI startup console for a
+traceback mentioning `bobs_`. The package needs no dependencies beyond ComfyUI
+itself, so this is usually a partial clone or a stale `__pycache__`.
+
+**`WARNING: N% of UNet tensors landed in '<block>'`.** The node and the model
+disagree about the architecture — e.g. an SDXL model in the FLUX node. Switch to
+the node matching your model, or to Universal. The LoRA still applies, but the
+block sliders won't mean what their names say.
+
+**`none of its tensors match this model`.** The LoRA was trained for a different
+architecture than the loaded model. Nothing is applied and the model passes
+through untouched.
+
+**High `Other Tensors` count.** The classifier placed those tensors nowhere.
+For the FLUX/SDXL nodes this usually means the wrong node for the model; try
+Universal. If Universal also shows a high count, that's worth
+[an issue](https://github.com/BobsBlazed/Bobs-Lora-Loader/issues) — please
+include the `info` output, which names the architecture and stacks it found.
+
+**Results differ from the built-in `LoraLoader`.** With `Full (Normal LoRA)` at
+the same strength they should match. Any other preset deliberately differs —
+that's the point of the node.
 
 ## Development
 
-The block-classification logic lives in `bobs_blocks.py` and deliberately imports nothing from ComfyUI or torch, so it can be tested on a bare interpreter:
+The classification logic imports nothing from ComfyUI or torch, so the test
+suite runs on a bare interpreter:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
+| File | Contents |
+|---|---|
+| `bobs_blocks.py` | FLUX and SDXL block tables, presets, classifiers, strength resolution |
+| `bobs_universal.py` | Runtime stack discovery and the depth-axis classifier |
+| `bobs_lora_loader.py` | The ComfyUI nodes: key maps, patch routing, reporting |
+| `tests/` | 71 tests, no ComfyUI or torch required |
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how classification works
+and how to add support for a new architecture.
+
 ## Changelog
 
-### 1.2.1
+See [`CHANGELOG.md`](CHANGELOG.md). Latest release: **1.2.1**.
 
-Code-review fixes. No behaviour change for a correctly-paired LoRA and model.
+## License
 
--   **The FLUX and SDXL classifiers now anchor on the module path**, matching
-    the Universal loader. They previously matched on an underscore-normalised
-    key, which erases the separator that tells an *outermost* block stack from
-    one nested inside a block. An SDXL key such as
-    `input_blocks.4.1.transformer_blocks.0.attn1.to_q.weight` was read as
-    double-stream block 0, so pointing the FLUX node at an SDXL model filed
-    every tensor under "Early Downsampling". Real FLUX and SDXL keys are
-    unaffected — this only ever misfired across families.
--   **Mismatched loader and model now warn** instead of failing silently. If
-    90% or more of a LoRA's UNet tensors land in one block, the `info` output
-    and the log say so and point at the Universal loader. Measured: a real SDXL
-    key set through the FLUX node warns at 99%, a FLUX key set through the SDXL
-    node at 100%, while all six correctly-paired combinations stay silent.
--   **Families register explicitly** via `register_family()` rather than by
-    mutating `bobs_blocks`'s tables at import time, removing an import-order
-    dependency that also made the test suite fragile.
--   **Tooltips are per family.** FLUX/SDXL and Universal each define a block
-    called "Text Encoder"; the Universal wording used to overwrite the other.
--   **`Output Head` detection tightened.** The `_head_` substring also matched
-    `multi_head_attention` and `head_dim_proj`; it is now anchored to a real
-    head module.
--   An unknown `preset` name (only reachable from hand-edited workflow JSON)
-    logs a warning instead of silently behaving as `Custom`.
--   Test suite grown to 71, including a new `tests/test_node_behaviour.py`
-    covering node registration, widget order, the report and the new warning.
-
-### 1.2.0
-
-**New: a Universal loader covering every architecture ComfyUI supports.**
-
--   **`Bobs LoRA Loader (Universal)`** handles SD1.5, SD2, SDXL, SD3/3.5, FLUX,
-    Chroma, AuraFlow, PixArt, HiDream, Qwen-Image, Wan, LTX-Video, Mochi,
-    HunyuanVideo/DiT, Lumina, Cosmos and anything else built as stacks of
-    repeated blocks. The block layout is *discovered from the loaded model* —
-    stack names, stack sizes and their execution order — rather than read from a
-    per-family table, so pruned, distilled and brand-new architectures work
-    without a code change.
--   Weights are assigned along a normalised depth axis (Early → Late), plus
-    embeddings, output head and text encoder, so the same sliders mean the same
-    thing across very different models.
--   The `info` output now reports the detected architecture and the discovered
-    stacks, e.g. `architecture: QwenImage  transformer_blocks[60]  (total 60)`.
-    The FLUX and SDXL loaders report their architecture too.
-
-**Verified against real ComfyUI.** The classification logic was run against
-models built from ComfyUI's own configs and against its `*_to_diffusers` key
-tables, covering SD1.5, SDXL, SD3, FLUX (full and pruned geometry), AuraFlow,
-PixArt, LTX-Video, Lumina, Qwen-Image and Wan — 8,000+ authentic state-dict
-keys, all classified with none falling through to `Other Tensors`. That pass
-found and fixed several real gaps that synthetic fixtures had missed:
-
--   SD3 addresses its final block as `joint_blocks.-1`; negative indices are now
-    resolved against the stack size instead of failing to match.
--   Lumina's `noise_refiner` / `context_refiner` stacks are recognised and
-    ordered ahead of the main `layers` stack.
--   AuraFlow's native `double_layers` / `single_layers` names are handled, not
-    just the diffusers spelling.
--   Conditioning embedders that previously fell through — PixArt's `ar_embedder`,
-    `csize_embedder` and `t_block`, LTX-Video's `adaln_single` and
-    `scale_shift_table`, Qwen-Image's `txt_norm`, Wan's `time_projection`,
-    AuraFlow's `cond_seq_linear` / `positional_encoding` — now land in
-    `Input & Embeddings`.
--   FLUX's ControlNet `pos_embed_input` now maps to `Image Hint`.
-
-Existing FLUX and SDXL workflows are unaffected: no widget was added, removed or
-reordered on those two nodes.
-
-### 1.1.0
-
-**Block weighting now actually works.** This release fixes a defect that made the per-block sliders unreliable for every LoRA.
-
--   **Fixed: patches were classified by the wrong key.** ComfyUI's `key_map` maps a LoRA's key name to the *model state-dict key string* it targets (or a `(key, offset)` tuple for fused FLUX `qkv` / `linear1` weights). The previous code treated those values as `nn.Module` objects and indexed `[0]` on them, which on a string yields its first *character*. Every patch therefore resolved through a single arbitrary lookup, so all weights were effectively bucketed together rather than per block. Classification now runs directly on the canonical target key, and fused `(key, offset)` patches are unpacked correctly.
--   **Fixed: SDXL "unclassified" patches were silently discarded.** Anything that did not match input/middle/output/text-encoder was collected and then never applied. Those tensors now have their own `Other Tensors` weight.
--   **Fixed: model and CLIP patches are routed properly.** The FLUX loader previously pushed every patch group at its block strength into *both* the model and the CLIP patcher, with no separate text-encoder control. Model and text-encoder patches are now split by which key map owns the key, and FLUX gains a `Text Encoder` slider.
--   **Fixed: dead FLUX index ranges.** The old table mapped `double_blocks.19–28`, which do not exist on any FLUX model. Ranges are now computed from the loaded model's own `depth` / `depth_single_blocks`, so pruned and distilled variants map correctly too.
--   **Security: no more bare `torch.load`.** Non-safetensors LoRAs are read through `comfy.utils.load_torch_file(..., safe_load=True)`, which sets `weights_only=True`. Loading a `.ckpt`/`.pt` LoRA no longer risks executing pickled code.
--   **Added: LoRA file caching.** The file is re-read only when its path, size or mtime changes, instead of on every graph execution.
--   **Added: `info` string output** with a per-block table of weight / found / applied, plus console logging that explains empty blocks.
--   **Added: `comfy.lora_convert` support** (guarded), so BFL-control, Wan-Fun and USO LoRAs are converted before loading.
--   **Added: optional `clip` input**, tooltips on every widget, node descriptions, and a `Detail & Texture` preset for both families.
--   **Added: unit tests** and CI covering the classification and strength-resolution logic.
--   Errors (missing file, unreadable file, no matching keys) now return the graph inputs unchanged with an explanation on the `info` output instead of only logging.
-
-**Compatibility:** existing workflows keep working. New widgets were appended after the existing ones and new outputs after the existing ones, so saved widget values and links stay aligned. Expect different — correct — results from the same slider settings, since the sliders previously did not target the blocks they named.
+[Apache-2.0](LICENSE)
